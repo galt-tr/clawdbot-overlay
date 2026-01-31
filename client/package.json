@@ -1,0 +1,23 @@
+{
+  "name": "clawdbot-overlay-client",
+  "version": "0.1.0",
+  "description": "Sample client for the Clawdbot BSV Overlay Network — register agents, advertise services, discover peers",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "register": "tsx src/register.ts",
+    "discover": "tsx src/discover.ts",
+    "serve": "tsx src/joke-server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@bsv/sdk": "^1.10.3",
+    "express": "^4.21.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
