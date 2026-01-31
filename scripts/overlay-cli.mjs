@@ -1618,6 +1618,23 @@ function formatServiceResponse(serviceId, status, result) {
         },
       };
     
+    case 'translate':
+      return {
+        ...base,
+        type: 'translate',
+        summary: result?.error
+          ? `Translation failed: ${result.error}`
+          : `Translated (${result?.from || '?'} → ${result?.to || '?'}): "${result?.translatedText?.slice(0, 100)}${result?.translatedText?.length > 100 ? '...' : ''}"`,
+        details: {
+          originalText: result?.originalText,
+          translatedText: result?.translatedText,
+          from: result?.from,
+          to: result?.to,
+          provider: result?.provider,
+          error: result?.error,
+        },
+      };
+    
     default:
       // Generic service response — show preview of result
       const resultPreview = result
@@ -1782,6 +1799,8 @@ async function processMessage(msg, identityKey, privKey) {
       return await processCodeReview(msg, identityKey, privKey);
     } else if (serviceId === 'web-research') {
       return await processWebResearch(msg, identityKey, privKey);
+    } else if (serviceId === 'translate') {
+      return await processTranslate(msg, identityKey, privKey);
     } else {
       // Unknown service — don't auto-process
       return {
@@ -2343,10 +2362,310 @@ async function processWebResearch(msg, identityKey, privKey) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Service: translate (20 sats)
+// ---------------------------------------------------------------------------
+
+async function processTranslate(msg, identityKey, privKey) {
+  const PRICE = 20;
+  const payment = msg.payload?.payment;
+  const input = msg.payload?.input || msg.payload;
+  const text = input?.text;
+  const targetLang = input?.to || input?.targetLang || input?.target || 'en';
+  const sourceLang = input?.from || input?.sourceLang || input?.source || 'auto';
+
+  // Helper to send rejection
+  async function reject(reason, shortReason) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'translate',
+      status: 'rejected',
+      reason,
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetch(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    });
+    return { id: msg.id, type: 'service-request', serviceId: 'translate', action: 'rejected', reason: shortReason, from: msg.from, ack: true };
+  }
+
+  // Validate input
+  if (!text || typeof text !== 'string' || text.trim().length < 1) {
+    return reject('Missing or invalid text. Send {input: {text: "your text", to: "es"}}', 'no text');
+  }
+  if (text.length > 5000) {
+    return reject('Text too long. Maximum 5000 characters.', 'text too long');
+  }
+
+  // ── Payment verification ──
+  if (!payment || !payment.beef || !payment.satoshis) {
+    return reject(`No payment included. Translation costs ${PRICE} sats.`, 'no payment');
+  }
+  if (payment.satoshis < PRICE) {
+    return reject(`Insufficient payment: ${payment.satoshis} sats sent, ${PRICE} required.`, `underpaid: ${payment.satoshis} < ${PRICE}`);
+  }
+
+  // ── Validate BEEF ──
+  let beefBytes;
+  try { beefBytes = Uint8Array.from(atob(payment.beef), c => c.charCodeAt(0)); } catch { beefBytes = null; }
+  let paymentTx = null;
+  let isAtomicBeef = false;
+  if (beefBytes && beefBytes.length > 20) {
+    try { paymentTx = Transaction.fromAtomicBEEF(Array.from(beefBytes)); isAtomicBeef = true; } catch {}
+    if (!paymentTx) try { const b = Beef.fromBinary(Array.from(beefBytes)); paymentTx = b.txs?.find(t => t.tx)?.tx; } catch {}
+  }
+  if (!paymentTx) {
+    return reject('Invalid payment BEEF.', 'invalid BEEF');
+  }
+
+  // ── Find our output & accept payment ──
+  const identityPath = path.join(WALLET_DIR, 'wallet-identity.json');
+  const walletIdentity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
+  const ourPrivKey = PrivateKey.fromHex(walletIdentity.rootKeyHex);
+  const ourPubKey = ourPrivKey.toPublicKey();
+  const ourHash160 = Hash.hash160(ourPubKey.encode(true));
+  const ourHash160Hex = Array.from(ourHash160).map(b => b.toString(16).padStart(2, '0')).join('');
+
+  let paymentOutputIndex = -1;
+  let paymentSats = 0;
+  for (let i = 0; i < paymentTx.outputs.length; i++) {
+    const scriptHex = paymentTx.outputs[i].lockingScript.toHex();
+    if (scriptHex.includes(ourHash160Hex)) { paymentOutputIndex = i; paymentSats = paymentTx.outputs[i].satoshis; break; }
+  }
+  if (paymentOutputIndex < 0 || paymentSats < PRICE) {
+    return reject(paymentOutputIndex < 0 ? 'No output paying our address.' : `Output pays ${paymentSats} sats, ${PRICE} required.`, paymentOutputIndex < 0 ? 'no output to us' : `underpaid output: ${paymentSats}`);
+  }
+
+  const paymentTxid = paymentTx.id('hex');
+
+  // Accept into wallet
+  let walletAccepted = false;
+  let acceptError = null;
+  const derivPrefix = Utils.toBase64(Array.from(new TextEncoder().encode('translate')));
+  const derivSuffix = Utils.toBase64(Array.from(new TextEncoder().encode(paymentTxid.slice(0, 16))));
+  const internalizeArgs = {
+    outputs: [{
+      outputIndex: paymentOutputIndex,
+      protocol: 'wallet payment',
+      paymentRemittance: { derivationPrefix: derivPrefix, derivationSuffix: derivSuffix, senderIdentityKey: msg.from },
+    }],
+    description: `Translation payment from ${msg.from.slice(0, 12)}...`,
+  };
+
+  try {
+    const wallet = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
+    const atomicBytes = isAtomicBeef ? new Uint8Array(beefBytes) : new Uint8Array(Beef.fromBinary(Array.from(beefBytes)).toBinaryAtomic(paymentTxid));
+    await wallet._setup.wallet.storage.internalizeAction({ tx: atomicBytes, ...internalizeArgs });
+    await wallet.destroy();
+    walletAccepted = true;
+  } catch (err1) {
+    // Fallback: rebuild from WoC
+    try {
+      const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
+      const txChain = [];
+      let curTx = paymentTx;
+      let curTxid = paymentTxid;
+      txChain.push({ tx: curTx, txid: curTxid });
+      for (let depth = 0; depth < 10; depth++) {
+        const srcTxid = curTx.inputs[0].sourceTXID;
+        const srcHexResp = await wocFetch(`/tx/${srcTxid}/hex`);
+        if (!srcHexResp.ok) throw new Error(`WoC ${srcHexResp.status}`);
+        const srcTx = Transaction.fromHex(await srcHexResp.text());
+        const srcInfoResp = await wocFetch(`/tx/${srcTxid}`);
+        if (!srcInfoResp.ok) throw new Error(`WoC ${srcInfoResp.status}`);
+        const srcInfo = await srcInfoResp.json();
+        if (srcInfo.confirmations > 0 && srcInfo.blockheight) {
+          const proofResp = await wocFetch(`/tx/${srcTxid}/proof/tsc`);
+          if (proofResp.ok) {
+            const pd = await proofResp.json();
+            if (Array.isArray(pd) && pd.length > 0) srcTx.merklePath = buildMerklePathFromTSC(srcTxid, pd[0].index, pd[0].nodes, srcInfo.blockheight);
+          }
+          txChain.push({ tx: srcTx, txid: srcTxid });
+          break;
+        }
+        txChain.push({ tx: srcTx, txid: srcTxid });
+        curTx = srcTx;
+        curTxid = srcTxid;
+      }
+      const freshBeef = new Beef();
+      for (let i = txChain.length - 1; i >= 0; i--) freshBeef.mergeTransaction(txChain[i].tx);
+      const freshAtomicBytes = new Uint8Array(freshBeef.toBinaryAtomic(paymentTxid));
+      const wallet2 = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
+      await wallet2._setup.wallet.storage.internalizeAction({ tx: freshAtomicBytes, ...internalizeArgs });
+      await wallet2.destroy();
+      walletAccepted = true;
+    } catch (err2) {
+      acceptError = `Attempt 1: ${err1.message} | Attempt 2: ${err2.message}`;
+    }
+  }
+
+  // ── Perform the translation using LibreTranslate or MyMemory API ──
+  let translationResult;
+  try {
+    translationResult = await performTranslation(text.trim(), sourceLang, targetLang);
+  } catch (err) {
+    translationResult = { error: `Translation failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+
+  // Send response
+  const responsePayload = {
+    requestId: msg.id,
+    serviceId: 'translate',
+    status: translationResult.error ? 'partial' : 'fulfilled',
+    result: translationResult,
+    paymentAccepted: true,
+    paymentTxid,
+    satoshisReceived: paymentSats,
+    walletAccepted,
+    ...(acceptError ? { walletError: acceptError } : {}),
+  };
+  const respSig = signRelayMessage(privKey, msg.from, 'service-response', responsePayload);
+  await fetch(`${OVERLAY_URL}/relay/send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      from: identityKey, to: msg.from, type: 'service-response',
+      payload: responsePayload, signature: respSig,
+    }),
+  });
+
+  return {
+    id: msg.id,
+    type: 'service-request',
+    serviceId: 'translate',
+    action: translationResult.error ? 'partial' : 'fulfilled',
+    translation: translationResult,
+    paymentAccepted: true,
+    paymentTxid,
+    satoshisReceived: paymentSats,
+    walletAccepted,
+    direction: 'incoming-request',
+    formatted: {
+      type: 'translation',
+      summary: translationResult.error
+        ? `Translation failed: ${translationResult.error}`
+        : `Translated ${sourceLang} → ${targetLang}: "${translationResult.translatedText?.slice(0, 50)}${translationResult.translatedText?.length > 50 ? '...' : ''}"`,
+      earnings: paymentSats,
+    },
+    ...(acceptError ? { walletError: acceptError } : {}),
+    from: msg.from,
+    ack: true,
+  };
+}
+
 /**
- * Perform web research using Brave Search API via fetch.
- * Returns a synthesized answer with sources — no LLM, just structured extraction.
+ * Perform translation using MyMemory API (free, no API key required).
+ * Falls back to a simple response if API fails.
  */
+async function performTranslation(text, sourceLang, targetLang) {
+  // Normalize language codes
+  const langMap = {
+    'auto': 'autodetect',
+    'en': 'en', 'english': 'en',
+    'es': 'es', 'spanish': 'es',
+    'fr': 'fr', 'french': 'fr',
+    'de': 'de', 'german': 'de',
+    'it': 'it', 'italian': 'it',
+    'pt': 'pt', 'portuguese': 'pt',
+    'ru': 'ru', 'russian': 'ru',
+    'zh': 'zh', 'chinese': 'zh',
+    'ja': 'ja', 'japanese': 'ja',
+    'ko': 'ko', 'korean': 'ko',
+    'ar': 'ar', 'arabic': 'ar',
+    'hi': 'hi', 'hindi': 'hi',
+    'nl': 'nl', 'dutch': 'nl',
+    'pl': 'pl', 'polish': 'pl',
+    'sv': 'sv', 'swedish': 'sv',
+    'tr': 'tr', 'turkish': 'tr',
+    'vi': 'vi', 'vietnamese': 'vi',
+    'th': 'th', 'thai': 'th',
+    'id': 'id', 'indonesian': 'id',
+    'cs': 'cs', 'czech': 'cs',
+    'uk': 'uk', 'ukrainian': 'uk',
+    'el': 'el', 'greek': 'el',
+    'he': 'he', 'hebrew': 'he',
+    'da': 'da', 'danish': 'da',
+    'fi': 'fi', 'finnish': 'fi',
+    'no': 'no', 'norwegian': 'no',
+    'ro': 'ro', 'romanian': 'ro',
+    'hu': 'hu', 'hungarian': 'hu',
+    'bg': 'bg', 'bulgarian': 'bg',
+    'hr': 'hr', 'croatian': 'hr',
+    'sk': 'sk', 'slovak': 'sk',
+    'sl': 'sl', 'slovenian': 'sl',
+    'et': 'et', 'estonian': 'et',
+    'lv': 'lv', 'latvian': 'lv',
+    'lt': 'lt', 'lithuanian': 'lt',
+  };
+
+  const from = langMap[sourceLang.toLowerCase()] || sourceLang.toLowerCase().slice(0, 2);
+  const to = langMap[targetLang.toLowerCase()] || targetLang.toLowerCase().slice(0, 2);
+
+  // Use MyMemory Translation API (free, no key required, 1000 chars/day limit per IP for anonymous)
+  const langPair = from === 'autodetect' ? `|${to}` : `${from}|${to}`;
+  const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${encodeURIComponent(langPair)}`;
+
+  try {
+    const resp = await fetchWithTimeout(url, {}, 15000);
+    if (!resp.ok) {
+      throw new Error(`MyMemory API returned ${resp.status}`);
+    }
+    const data = await resp.json();
+
+    if (data.responseStatus === 200 && data.responseData?.translatedText) {
+      const detectedLang = data.responseData?.detectedLanguage || from;
+      return {
+        originalText: text,
+        translatedText: data.responseData.translatedText,
+        from: typeof detectedLang === 'string' ? detectedLang : from,
+        to: to,
+        confidence: data.responseData?.match || null,
+        provider: 'MyMemory',
+      };
+    } else {
+      throw new Error(data.responseDetails || 'Translation failed');
+    }
+  } catch (err) {
+    // Fallback: try LibreTranslate public instance
+    try {
+      const libreUrl = 'https://libretranslate.com/translate';
+      const libreResp = await fetchWithTimeout(libreUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          q: text,
+          source: from === 'autodetect' ? 'auto' : from,
+          target: to,
+          format: 'text',
+        }),
+      }, 15000);
+
+      if (libreResp.ok) {
+        const libreData = await libreResp.json();
+        if (libreData.translatedText) {
+          return {
+            originalText: text,
+            translatedText: libreData.translatedText,
+            from: libreData.detectedLanguage?.language || from,
+            to: to,
+            provider: 'LibreTranslate',
+          };
+        }
+      }
+    } catch { /* fallback failed */ }
+
+    // Return error
+    return {
+      error: err instanceof Error ? err.message : String(err),
+      originalText: text,
+      from: from,
+      to: to,
+    };
+  }
+}
+
 /** Analyze a GitHub PR diff for common issues. */
 function analyzePrReview(prInfo, diff) {
   const files = prInfo.files || [];

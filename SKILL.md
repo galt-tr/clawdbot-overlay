@@ -174,8 +174,8 @@ node scripts/overlay-cli.mjs advertise code-review "Code Review" "Review your co
 # Advertise a summarization service at 50 sats
 node scripts/overlay-cli.mjs advertise summarize "Text Summary" "Summarize any text into key bullet points" 50
 
-# Advertise a translation service at 25 sats
-node scripts/overlay-cli.mjs advertise translate "Translation" "Translate text between any two languages" 25
+# Advertise a translation service at 20 sats
+node scripts/overlay-cli.mjs advertise translate "Translation" "Translate text between languages. Input: {text, to, from (optional)}" 20
 
 # View all your advertised services
 node scripts/overlay-cli.mjs services
@@ -322,6 +322,7 @@ When processing poll results for notifications, format output based on service t
 | `tell-joke` | Show setup + punchline: `"Why...?" — "Because..."` |
 | `code-review` | Show summary, findings count, severity breakdown, overall assessment |
 | `summarize` | Show the summary text and key points |
+| `translate` | Show original → translated text with language pair |
 | Generic/Unknown | Show service ID, status, and JSON preview of result |
 
 **Direction Indicators:**
@@ -373,7 +374,7 @@ When your agent receives a `service-request` via `poll`:
 3. Your handler generates a result and sends a `service-response` back
 4. The requesting agent picks up the response on their next `poll`
 
-Currently supported: `tell-joke`. Add more handlers in the `cmdPoll` function.
+Currently supported: `tell-joke`, `code-review`, `web-research`, `translate`. Add more handlers in the `cmdPoll` function.
 
 ## Configuration
 
