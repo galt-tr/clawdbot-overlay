@@ -108,12 +108,35 @@ const { PrivateKey, PublicKey, Hash, Utils, Transaction, Script, P2PKH, Beef, Me
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
+
+// Auto-load .env from overlay state dir if it exists
+const _overlayEnvPath = path.join(os.homedir(), '.clawdbot', 'bsv-overlay', '.env');
+try {
+  if (fs.existsSync(_overlayEnvPath)) {
+    for (const line of fs.readFileSync(_overlayEnvPath, 'utf-8').split('\n')) {
+      const match = line.match(/^([A-Z_]+)=(.+)$/);
+      if (match && !process.env[match[1]]) process.env[match[1]] = match[2].trim();
+    }
+  }
+} catch {}
+
 const WALLET_DIR = process.env.BSV_WALLET_DIR
   || path.join(os.homedir(), '.clawdbot', 'bsv-wallet');
 const NETWORK = process.env.BSV_NETWORK || 'mainnet';
 const OVERLAY_URL = process.env.OVERLAY_URL || 'http://162.243.168.235:8080';
+const WOC_API_KEY = process.env.WOC_API_KEY || '';
 const OVERLAY_STATE_DIR = path.join(os.homedir(), '.clawdbot', 'bsv-overlay');
 const PROTOCOL_ID = 'clawdbot-overlay-v1';
+
+/** Fetch from WhatsonChain with optional API key auth */
+function wocFetch(urlPath, options = {}) {
+  const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
+  const base = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
+  const url = urlPath.startsWith('http') ? urlPath : `${base}${urlPath}`;
+  const headers = { ...(options.headers || {}) };
+  if (WOC_API_KEY) headers['Authorization'] = `Bearer ${WOC_API_KEY}`;
+  return fetch(url, { ...options, headers });
+}
 const TOPICS = { IDENTITY: 'tm_clawdbot_identity', SERVICES: 'tm_clawdbot_services' };
 const LOOKUP_SERVICES = { AGENTS: 'ls_clawdbot_agents', SERVICES: 'ls_clawdbot_services' };
 
@@ -268,7 +291,7 @@ async function buildRealOverlayTransaction(payload, topic) {
 
   let utxos = [];
   try {
-    const resp = await fetch(`${wocBase}/address/${walletAddress}/unspent`);
+    const resp = await wocFetch(`/address/${walletAddress}/unspent`);
     if (resp.ok) utxos = await resp.json();
   } catch { /* fallback to synthetic */ }
 
@@ -293,18 +316,18 @@ async function buildRealOverlayTransaction(payload, topic) {
 /** Build a real funded transaction using WoC UTXO */
 async function buildRealFundedTx(payload, topic, utxo, privKey, pubKey, hash160, walletAddress, wocBase) {
   // Fetch raw source tx
-  const rawResp = await fetch(`${wocBase}/tx/${utxo.tx_hash}/hex`);
+  const rawResp = await wocFetch(`/tx/${utxo.tx_hash}/hex`);
   if (!rawResp.ok) throw new Error(`Failed to fetch source tx: ${rawResp.status}`);
   const rawTxHex = await rawResp.text();
   const sourceTx = Transaction.fromHex(rawTxHex);
 
   // Fetch merkle proof for the source tx
-  const txInfoResp = await fetch(`${wocBase}/tx/${utxo.tx_hash}`);
+  const txInfoResp = await wocFetch(`/tx/${utxo.tx_hash}`);
   const txInfo = await txInfoResp.json();
   const blockHeight = txInfo.blockheight;
 
   if (blockHeight && txInfo.confirmations > 0) {
-    const proofResp = await fetch(`${wocBase}/tx/${utxo.tx_hash}/proof/tsc`);
+    const proofResp = await wocFetch(`/tx/${utxo.tx_hash}/proof/tsc`);
     if (proofResp.ok) {
       const proofData = await proofResp.json();
       if (Array.isArray(proofData) && proofData.length > 0) {
@@ -614,7 +637,7 @@ async function cmdBalance() {
     const address = Utils.toBase58(Array.from(addressBytes));
 
     const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
-    const resp = await fetch(`https://api.whatsonchain.com/v1/bsv/${wocNet}/address/${address}/balance`);
+    const resp = await wocFetch(`/address/${address}/balance`);
     if (resp.ok) {
       const bal = await resp.json();
       onChain = {
@@ -639,7 +662,7 @@ async function cmdImport(txidArg, voutStr) {
   const wocBase = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
 
   // Check confirmation status
-  const txInfoResp = await fetch(`${wocBase}/tx/${txid}`);
+  const txInfoResp = await wocFetch(`/tx/${txid}`);
   if (!txInfoResp.ok) return fail(`Failed to fetch tx info: ${txInfoResp.status}`);
   const txInfo = await txInfoResp.json();
 
@@ -649,7 +672,7 @@ async function cmdImport(txidArg, voutStr) {
   const blockHeight = txInfo.blockheight;
 
   // Fetch raw tx
-  const rawTxResp = await fetch(`${wocBase}/tx/${txid}/hex`);
+  const rawTxResp = await wocFetch(`/tx/${txid}/hex`);
   if (!rawTxResp.ok) return fail(`Failed to fetch raw tx: ${rawTxResp.status}`);
   const rawTxHex = await rawTxResp.text();
   const sourceTx = Transaction.fromHex(rawTxHex);
@@ -657,7 +680,7 @@ async function cmdImport(txidArg, voutStr) {
   if (!output) return fail(`Output index ${vout} not found (tx has ${sourceTx.outputs.length} outputs)`);
 
   // Fetch TSC merkle proof
-  const proofResp = await fetch(`${wocBase}/tx/${txid}/proof/tsc`);
+  const proofResp = await wocFetch(`/tx/${txid}/proof/tsc`);
   if (!proofResp.ok) return fail(`Failed to fetch merkle proof: ${proofResp.status}`);
   const proofData = await proofResp.json();
   if (!Array.isArray(proofData) || proofData.length === 0) return fail('No merkle proof available');
@@ -728,7 +751,7 @@ async function cmdRefund(targetAddress) {
   const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
   const wocBase = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
 
-  const utxoResp = await fetch(`${wocBase}/address/${sourceAddress}/unspent`);
+  const utxoResp = await wocFetch(`/address/${sourceAddress}/unspent`);
   if (!utxoResp.ok) return fail(`Failed to fetch UTXOs: ${utxoResp.status}`);
   const utxos = await utxoResp.json();
   if (!utxos || utxos.length === 0) return fail(`No UTXOs found for ${sourceAddress}`);
@@ -736,7 +759,7 @@ async function cmdRefund(targetAddress) {
   const sourceTxCache = {};
   for (const utxo of utxos) {
     if (!sourceTxCache[utxo.tx_hash]) {
-      const txResp = await fetch(`${wocBase}/tx/${utxo.tx_hash}/hex`);
+      const txResp = await wocFetch(`/tx/${utxo.tx_hash}/hex`);
       if (!txResp.ok) return fail(`Failed to fetch source tx ${utxo.tx_hash}`);
       sourceTxCache[utxo.tx_hash] = await txResp.text();
     }
@@ -770,7 +793,7 @@ async function cmdRefund(targetAddress) {
   const rawTxHex = tx.toHex();
   const txid = tx.id('hex');
 
-  const broadcastResp = await fetch(`${wocBase}/tx/raw`, {
+  const broadcastResp = await wocFetch(`/tx/raw`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ txhex: rawTxHex }),
@@ -835,7 +858,7 @@ async function buildDirectPayment(recipientPubKey, sats, desc) {
   const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
   const wocBase = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
 
-  const utxoResp = await fetch(`${wocBase}/address/${senderAddress}/unspent`);
+  const utxoResp = await wocFetch(`/address/${senderAddress}/unspent`);
   if (!utxoResp.ok) throw new Error(`Failed to fetch UTXOs: ${utxoResp.status}`);
   const allUtxos = await utxoResp.json();
 
@@ -850,18 +873,18 @@ async function buildDirectPayment(recipientPubKey, sats, desc) {
   const utxo = utxos[0]; // Use first sufficient UTXO
 
   // Fetch source transaction
-  const rawResp = await fetch(`${wocBase}/tx/${utxo.tx_hash}/hex`);
+  const rawResp = await wocFetch(`/tx/${utxo.tx_hash}/hex`);
   if (!rawResp.ok) throw new Error(`Failed to fetch source tx: ${rawResp.status}`);
   const rawTxHex = await rawResp.text();
   const sourceTx = Transaction.fromHex(rawTxHex);
 
   // Fetch merkle proof for source tx
-  const txInfoResp = await fetch(`${wocBase}/tx/${utxo.tx_hash}`);
+  const txInfoResp = await wocFetch(`/tx/${utxo.tx_hash}`);
   const txInfo = await txInfoResp.json();
   const blockHeight = txInfo.blockheight;
 
   if (blockHeight && txInfo.confirmations > 0) {
-    const proofResp = await fetch(`${wocBase}/tx/${utxo.tx_hash}/proof/tsc`);
+    const proofResp = await wocFetch(`/tx/${utxo.tx_hash}/proof/tsc`);
     if (proofResp.ok) {
       const proofData = await proofResp.json();
       if (Array.isArray(proofData) && proofData.length > 0) {
@@ -920,7 +943,7 @@ async function buildDirectPayment(recipientPubKey, sats, desc) {
   const beefBase64 = Utils.toBase64(Array.from(atomicBeefBytes));
 
   // Broadcast the transaction
-  const broadcastResp = await fetch(`${wocBase}/tx/raw`, {
+  const broadcastResp = await wocFetch(`/tx/raw`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ txhex: tx.toHex() }),
@@ -1675,17 +1698,17 @@ async function processCodeReview(msg, identityKey, privKey) {
 
       for (let depth = 0; depth < 10; depth++) {
         const srcTxid = curTx.inputs[0].sourceTXID;
-        const srcHexResp = await fetch(`${wocBase}/tx/${srcTxid}/hex`);
+        const srcHexResp = await wocFetch(`/tx/${srcTxid}/hex`);
         if (!srcHexResp.ok) throw new Error(`WoC tx hex ${srcTxid.slice(0,12)}: ${srcHexResp.status}`);
         const srcHex = await srcHexResp.text();
         const srcTx = Transaction.fromHex(srcHex);
 
-        const srcInfoResp = await fetch(`${wocBase}/tx/${srcTxid}`);
+        const srcInfoResp = await wocFetch(`/tx/${srcTxid}`);
         if (!srcInfoResp.ok) throw new Error(`WoC tx info ${srcTxid.slice(0,12)}: ${srcInfoResp.status}`);
         const srcInfo = await srcInfoResp.json();
 
         if (srcInfo.confirmations > 0 && srcInfo.blockheight) {
-          const proofResp = await fetch(`${wocBase}/tx/${srcTxid}/proof/tsc`);
+          const proofResp = await wocFetch(`/tx/${srcTxid}/proof/tsc`);
           if (proofResp.ok) {
             const proofData = await proofResp.json();
             if (Array.isArray(proofData) && proofData.length > 0) {
@@ -2200,17 +2223,17 @@ async function processJokeRequest(msg, identityKey, privKey) {
 
       for (let depth = 0; depth < 10; depth++) {
         const srcTxid = curTx.inputs[0].sourceTXID;
-        const srcHexResp = await fetch(`${wocBase}/tx/${srcTxid}/hex`);
+        const srcHexResp = await wocFetch(`/tx/${srcTxid}/hex`);
         if (!srcHexResp.ok) throw new Error(`WoC tx hex ${srcTxid.slice(0,12)}: ${srcHexResp.status}`);
         const srcHex = await srcHexResp.text();
         const srcTx = Transaction.fromHex(srcHex);
 
-        const srcInfoResp = await fetch(`${wocBase}/tx/${srcTxid}`);
+        const srcInfoResp = await wocFetch(`/tx/${srcTxid}`);
         if (!srcInfoResp.ok) throw new Error(`WoC tx info ${srcTxid.slice(0,12)}: ${srcInfoResp.status}`);
         const srcInfo = await srcInfoResp.json();
 
         if (srcInfo.confirmations > 0 && srcInfo.blockheight) {
-          const proofResp = await fetch(`${wocBase}/tx/${srcTxid}/proof/tsc`);
+          const proofResp = await wocFetch(`/tx/${srcTxid}/proof/tsc`);
           if (proofResp.ok) {
             const proofData = await proofResp.json();
             if (Array.isArray(proofData) && proofData.length > 0) {

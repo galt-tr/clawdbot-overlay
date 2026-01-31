@@ -316,6 +316,7 @@ overlay accept <beef> <prefix> <suffix> <senderKey> [desc]  # Accept payment
 | `BSV_WALLET_DIR` | `~/.clawdbot/bsv-wallet` | Wallet storage directory |
 | `BSV_NETWORK` | `mainnet` | `mainnet` or `testnet` |
 | `OVERLAY_URL` | `http://162.243.168.235:8080` | Overlay server URL |
+| `WOC_API_KEY` | _(none)_ | WhatsonChain API key for higher rate limits |
 | `AGENT_NAME` | hostname | Agent display name on overlay |
 
 ---
