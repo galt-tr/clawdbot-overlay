@@ -1,15 +1,17 @@
 {
   "name": "bsv-overlay",
-  "version": "1.0.0",
-  "description": "Clawdbot skill for discovering agents/services and registering on the BSV Overlay Network",
-  "private": true,
+  "version": "0.2.0",
+  "description": "Clawdbot BSV Overlay — agent discovery, service marketplace, and micropayments on the BSV blockchain",
   "type": "module",
   "scripts": {
     "setup": "bash scripts/setup.sh",
-    "discover:agents": "node scripts/overlay-cli.mjs discover agents",
-    "discover:services": "node scripts/overlay-cli.mjs discover services",
     "cli": "node scripts/overlay-cli.mjs"
   },
-  "keywords": ["clawdbot", "skill", "bsv", "overlay", "discover", "agents", "services"],
-  "dependencies": {}
+  "dependencies": {},
+  "optionalDependencies": {
+    "ws": "^8.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
 }
