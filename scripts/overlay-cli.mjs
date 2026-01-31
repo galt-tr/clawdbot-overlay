@@ -1605,31 +1605,91 @@ async function cmdPoll() {
         const paymentTxid = paymentTx.id('hex');
         let walletAccepted = false;
         let acceptError = null;
+
+        // derivationPrefix/Suffix must be valid base64 per BRC-29
+        const derivPrefix = payment.derivationPrefix || Utils.toBase64(Array.from(new TextEncoder().encode('service-payment')));
+        const derivSuffix = payment.derivationSuffix || Utils.toBase64(Array.from(new TextEncoder().encode(paymentTxid.slice(0, 16))));
+        const internalizeArgs = {
+          outputs: [{
+            outputIndex: paymentOutputIndex,
+            protocol: 'wallet payment',
+            paymentRemittance: {
+              derivationPrefix: derivPrefix,
+              derivationSuffix: derivSuffix,
+              senderIdentityKey: msg.from,
+            },
+          }],
+          description: `Payment for tell-joke from ${msg.from.slice(0, 12)}...`,
+        };
+
+        // Attempt 1: use the BEEF as provided by sender
         try {
           const wallet = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
           const atomicBeefBytes = beef.toBinaryAtomic(paymentTxid);
-          // derivationPrefix/Suffix must be valid base64 per BRC-29
-          const derivPrefix = payment.derivationPrefix || Utils.toBase64(Array.from(new TextEncoder().encode('service-payment')));
-          const derivSuffix = payment.derivationSuffix || Utils.toBase64(Array.from(new TextEncoder().encode(paymentTxid.slice(0, 16))));
           await wallet._setup.wallet.storage.internalizeAction({
             tx: atomicBeefBytes,
-            outputs: [{
-              outputIndex: paymentOutputIndex,
-              protocol: 'wallet payment',
-              paymentRemittance: {
-                derivationPrefix: derivPrefix,
-                derivationSuffix: derivSuffix,
-                senderIdentityKey: msg.from,
-              },
-            }],
-            description: `Payment for tell-joke from ${msg.from.slice(0, 12)}...`,
+            ...internalizeArgs,
           });
           await wallet.destroy();
           walletAccepted = true;
-        } catch (err) {
-          acceptError = err instanceof Error ? err.message : String(err);
-          // Still serve the joke — the payment tx is on-chain regardless
-          // Just log the wallet import failure
+        } catch (err1) {
+          // Attempt 2: rebuild BEEF by fetching full ancestor chain from WhatsonChain
+          // This handles the case where the sender's BEEF doesn't include full merkle proofs
+          try {
+            const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
+            const wocBase = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
+
+            // Trace the tx chain back to a confirmed ancestor
+            const txChain = [];
+            let curTxid = paymentTxid;
+            let curTx = paymentTx;
+            txChain.push({ tx: curTx, txid: curTxid });
+
+            for (let depth = 0; depth < 10; depth++) {
+              const srcTxid = curTx.inputs[0].sourceTXID;
+              const srcHexResp = await fetch(`${wocBase}/tx/${srcTxid}/hex`);
+              const srcHex = await srcHexResp.text();
+              const srcTx = Transaction.fromHex(srcHex);
+
+              const srcInfoResp = await fetch(`${wocBase}/tx/${srcTxid}`);
+              const srcInfo = await srcInfoResp.json();
+
+              if (srcInfo.confirmations > 0 && srcInfo.blockheight) {
+                // Confirmed — fetch merkle proof
+                const proofResp = await fetch(`${wocBase}/tx/${srcTxid}/proof/tsc`);
+                if (proofResp.ok) {
+                  const proofData = await proofResp.json();
+                  if (Array.isArray(proofData) && proofData.length > 0) {
+                    const proof = proofData[0];
+                    srcTx.merklePath = buildMerklePathFromTSC(srcTxid, proof.index, proof.nodes, srcInfo.blockheight);
+                  }
+                }
+                txChain.push({ tx: srcTx, txid: srcTxid });
+                break;
+              }
+              txChain.push({ tx: srcTx, txid: srcTxid });
+              curTx = srcTx;
+              curTxid = srcTxid;
+            }
+
+            // Rebuild BEEF from confirmed ancestor up
+            const freshBeef = new Beef();
+            for (let i = txChain.length - 1; i >= 0; i--) {
+              freshBeef.mergeTransaction(txChain[i].tx);
+            }
+            const freshAtomicBytes = freshBeef.toBinaryAtomic(paymentTxid);
+
+            const wallet2 = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
+            await wallet2._setup.wallet.storage.internalizeAction({
+              tx: freshAtomicBytes,
+              ...internalizeArgs,
+            });
+            await wallet2.destroy();
+            walletAccepted = true;
+            acceptError = null;
+          } catch (err2) {
+            acceptError = `Attempt 1: ${err1 instanceof Error ? err1.message : String(err1)} | Attempt 2: ${err2 instanceof Error ? err2.message : String(err2)}`;
+          }
         }
 
         // ── Payment accepted — serve the joke ─────────────────────
@@ -1671,6 +1731,7 @@ async function cmdPoll() {
           paymentTxid,
           satoshisReceived: paymentSats,
           walletAccepted,
+          ...(acceptError ? { walletError: acceptError } : {}),
           from: msg.from,
         });
       } else {
