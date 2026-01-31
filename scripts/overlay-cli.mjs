@@ -364,8 +364,13 @@ async function buildRealFundedTx(payload, topic, utxo, privKey, pubKey, hash160,
   }
 
   await tx.sign();
-  const beef = tx.toBEEF();
   const txid = tx.id('hex');
+
+  // Build BEEF using Beef class (preserves merkle paths, unlike tx.toBEEF())
+  const beefObj = new Beef();
+  beefObj.mergeTransaction(sourceTx);
+  beefObj.mergeTransaction(tx);
+  const beef = beefObj.toBinary();
 
   // Submit to overlay
   const steak = await submitToOverlay(beef, [topic]);
@@ -2720,6 +2725,27 @@ async function cmdConnect() {
               console.error(JSON.stringify({ event: 'ack-error', id: result.id, message: String(ackErr) }));
             }
           }
+        }
+        // Handle service announcements from the overlay
+        if (envelope.type === 'service-announced') {
+          const svc = envelope.service || {};
+          const announcement = {
+            event: 'service-announced',
+            serviceId: svc.serviceId,
+            name: svc.name,
+            description: svc.description,
+            priceSats: svc.pricingSats,
+            provider: svc.identityKey,
+            txid: envelope.txid,
+            _ts: Date.now(),
+          };
+          console.log(JSON.stringify(announcement));
+          // Also write to notification log
+          const notifPath = path.join(OVERLAY_STATE_DIR, 'notifications.jsonl');
+          try {
+            fs.mkdirSync(OVERLAY_STATE_DIR, { recursive: true });
+            fs.appendFileSync(notifPath, JSON.stringify(announcement) + '\n');
+          } catch {}
         }
         // Ignore 'connected' type — just informational
       } catch (err) {
