@@ -1,0 +1,40 @@
+{
+  "name": "clawdbot-overlay",
+  "version": "0.1.0",
+  "description": "BSV Overlay Network for Clawdbot agent-to-agent discovery and commerce",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "bsv",
+    "overlay",
+    "clawdbot",
+    "agent",
+    "a2a",
+    "bitcoin"
+  ],
+  "author": "galt-tr",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/galt-tr/clawdbot-overlay.git"
+  },
+  "dependencies": {
+    "@bsv/overlay": "^0.6.0",
+    "@bsv/overlay-express": "^0.9.0",
+    "@bsv/sdk": "^1.9.24",
+    "better-sqlite3": "^11.0.0",
+    "knex": "^3.1.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.8",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.7.0"
+  }
+}
