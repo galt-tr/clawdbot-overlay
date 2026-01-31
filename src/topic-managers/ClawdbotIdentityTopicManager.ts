@@ -25,29 +25,97 @@ export class ClawdbotIdentityTopicManager implements TopicManager {
   }
 
   /**
+   * Extract data pushes from an OP_RETURN script.
+   *
+   * The @bsv/sdk v1.10+ parseChunks collapses everything after OP_RETURN
+   * into a single chunk with all remaining bytes as `data`. This helper
+   * re-parses those bytes to extract the individual pushdata fields.
+   *
+   * Supports both the legacy 4-chunk format and the collapsed 2-chunk format.
+   *
+   * @returns Array of Uint8Array data pushes, or null if not a valid OP_RETURN.
+   */
+  private extractOpReturnPushes (script: Script): Uint8Array[] | null {
+    const chunks = script.chunks
+
+    // --- Legacy 4+ chunk format (older SDK) ---
+    if (chunks.length >= 4 &&
+        chunks[0].op === OP.OP_FALSE &&
+        chunks[1].op === OP.OP_RETURN) {
+      const pushes: Uint8Array[] = []
+      for (let i = 2; i < chunks.length; i++) {
+        if (chunks[i].data) pushes.push(new Uint8Array(chunks[i].data!))
+      }
+      return pushes
+    }
+
+    // --- Collapsed 2-chunk format (SDK v1.10+) ---
+    // chunks[0] = OP_FALSE (op=0), chunks[1] = OP_RETURN with data blob
+    if (chunks.length === 2 &&
+        chunks[0].op === OP.OP_FALSE &&
+        chunks[1].op === OP.OP_RETURN &&
+        chunks[1].data) {
+      const blob = chunks[1].data
+      const pushes: Uint8Array[] = []
+      let pos = 0
+      while (pos < blob.length) {
+        const op = blob[pos++]
+        if (op > 0 && op <= 75) {
+          // Direct push: op is the byte count
+          const end = Math.min(pos + op, blob.length)
+          pushes.push(new Uint8Array(blob.slice(pos, end)))
+          pos = end
+        } else if (op === 0x4c) {
+          // OP_PUSHDATA1
+          const len = blob[pos++] ?? 0
+          const end = Math.min(pos + len, blob.length)
+          pushes.push(new Uint8Array(blob.slice(pos, end)))
+          pos = end
+        } else if (op === 0x4d) {
+          // OP_PUSHDATA2
+          const len = (blob[pos] ?? 0) | ((blob[pos + 1] ?? 0) << 8)
+          pos += 2
+          const end = Math.min(pos + len, blob.length)
+          pushes.push(new Uint8Array(blob.slice(pos, end)))
+          pos = end
+        } else if (op === 0x4e) {
+          // OP_PUSHDATA4
+          const len = ((blob[pos] ?? 0) |
+            ((blob[pos + 1] ?? 0) << 8) |
+            ((blob[pos + 2] ?? 0) << 16) |
+            ((blob[pos + 3] ?? 0) << 24)) >>> 0
+          pos += 4
+          const end = Math.min(pos + len, blob.length)
+          pushes.push(new Uint8Array(blob.slice(pos, end)))
+          pos = end
+        } else {
+          // Unknown op — skip
+          break
+        }
+      }
+      return pushes.length >= 2 ? pushes : null
+    }
+
+    return null
+  }
+
+  /**
    * Check if a script is a valid Clawdbot identity OP_RETURN output.
    * Expected format: OP_FALSE OP_RETURN <protocol_prefix> <json_payload>
    */
   private parseIdentityOutput (script: Script): ClawdbotIdentityData | null {
-    const chunks = script.chunks
-    if (chunks.length < 4) return null
+    const pushes = this.extractOpReturnPushes(script)
+    if (!pushes || pushes.length < 2) return null
 
-    // Check OP_FALSE OP_RETURN prefix
-    if (chunks[0].op !== OP.OP_FALSE) return null
-    if (chunks[1].op !== OP.OP_RETURN) return null
-
-    // Check protocol identifier
-    const protocolChunk = chunks[2]
-    if (!protocolChunk.data) return null
-    const protocolStr = new TextDecoder().decode(new Uint8Array(protocolChunk.data))
+    // Check protocol identifier (first push)
+    const protocolStr = new TextDecoder().decode(pushes[0])
     if (protocolStr !== PROTOCOL_ID) return null
 
-    // Parse JSON payload
-    const payloadChunk = chunks[3]
-    if (!payloadChunk.data) return null
+    // Parse JSON payload (second push)
+    const payloadBytes = pushes[1]
     try {
       const payload = JSON.parse(
-        new TextDecoder().decode(new Uint8Array(payloadChunk.data))
+        new TextDecoder().decode(payloadBytes)
       ) as ClawdbotIdentityData
 
       // Validate required fields

@@ -209,7 +209,12 @@ export function buildOverlayTransaction(
   privateKey: PrivateKey,
 ): { beef: number[]; txid: string } {
   const pubKey = privateKey.toPublicKey()
-  const pubKeyHash = pubKey.toHash('hex') as string
+  const pubKeyHashHex = pubKey.toHash('hex') as string
+  // P2PKH.lock() in @bsv/sdk v1.10+ expects number[] bytes, not hex string
+  const pubKeyHash: number[] = []
+  for (let i = 0; i < pubKeyHashHex.length; i += 2) {
+    pubKeyHash.push(parseInt(pubKeyHashHex.substring(i, i + 2), 16))
+  }
 
   // --- Step 1: Create a synthetic funding transaction ---
   // In production, this would be a real on-chain UTXO you own.
@@ -221,11 +226,15 @@ export function buildOverlayTransaction(
   })
 
   // Attach a synthetic merkle path so it passes scripts-only SPV check.
-  // The MerklePath says: "this tx was in block 1, at position 0, and it's
-  // the only tx in its pair (duplicate)."
+  // We use a two-leaf path (txid + sibling) which survives BEEF
+  // serialization/deserialization better than the duplicate-flag approach.
   const fundingTxid = fundingTx.id('hex')
+  // Generate a deterministic sibling hash from the txid (just needs to be 32 bytes)
+  const siblingHash = Hash.sha256(Array.from(new TextEncoder().encode(fundingTxid))) as number[]
+  const siblingHex = siblingHash.map(b => b.toString(16).padStart(2, '0')).join('')
   fundingTx.merklePath = new MerklePath(1, [[
-    { offset: 0, hash: fundingTxid, txid: true, duplicate: true },
+    { offset: 0, hash: fundingTxid, txid: true },
+    { offset: 1, hash: siblingHex },
   ]])
 
   // --- Step 2: Build the OP_RETURN transaction ---
@@ -353,6 +362,52 @@ export async function lookupOverlay(
  * @param outputIndex  Which output to read
  * @returns The decoded payload, or null if it's not a valid Clawdbot output
  */
+/**
+ * Extract data pushes from an OP_RETURN script, handling both the legacy
+ * 4-chunk format and the collapsed 2-chunk format in @bsv/sdk v1.10+.
+ */
+function extractOpReturnPushes(chunks: { op: number; data?: number[] }[]): Uint8Array[] | null {
+  // Legacy 4+ chunk format
+  if (chunks.length >= 4 && chunks[0].op === 0x00 && chunks[1].op === 0x6a) {
+    const pushes: Uint8Array[] = []
+    for (let i = 2; i < chunks.length; i++) {
+      if (chunks[i].data) pushes.push(new Uint8Array(chunks[i].data!))
+    }
+    return pushes
+  }
+
+  // Collapsed 2-chunk format (SDK v1.10+)
+  if (chunks.length === 2 && chunks[0].op === 0x00 && chunks[1].op === 0x6a && chunks[1].data) {
+    const blob = chunks[1].data
+    const pushes: Uint8Array[] = []
+    let pos = 0
+    while (pos < blob.length) {
+      const op = blob[pos++]
+      if (op > 0 && op <= 75) {
+        const end = Math.min(pos + op, blob.length)
+        pushes.push(new Uint8Array(blob.slice(pos, end)))
+        pos = end
+      } else if (op === 0x4c) {
+        const len = blob[pos++] ?? 0
+        const end = Math.min(pos + len, blob.length)
+        pushes.push(new Uint8Array(blob.slice(pos, end)))
+        pos = end
+      } else if (op === 0x4d) {
+        const len = (blob[pos] ?? 0) | ((blob[pos + 1] ?? 0) << 8)
+        pos += 2
+        const end = Math.min(pos + len, blob.length)
+        pushes.push(new Uint8Array(blob.slice(pos, end)))
+        pos = end
+      } else {
+        break
+      }
+    }
+    return pushes.length >= 2 ? pushes : null
+  }
+
+  return null
+}
+
 export function parseOverlayOutput(
   beef: number[],
   outputIndex: number,
@@ -362,25 +417,16 @@ export function parseOverlayOutput(
     const output = tx.outputs[outputIndex]
     if (!output?.lockingScript) return null
 
-    const chunks = output.lockingScript.chunks
-    if (chunks.length < 4) return null
-
-    // OP_FALSE (0x00)
-    if (chunks[0].op !== 0x00) return null
-    // OP_RETURN (0x6a)
-    if (chunks[1].op !== 0x6a) return null
+    const pushes = extractOpReturnPushes(output.lockingScript.chunks)
+    if (!pushes || pushes.length < 2) return null
 
     // Protocol prefix
-    const protocolChunk = chunks[2]
-    if (!protocolChunk.data) return null
-    const protocolStr = new TextDecoder().decode(new Uint8Array(protocolChunk.data))
+    const protocolStr = new TextDecoder().decode(pushes[0])
     if (protocolStr !== PROTOCOL_ID) return null
 
     // JSON payload
-    const payloadChunk = chunks[3]
-    if (!payloadChunk.data) return null
     const payload = JSON.parse(
-      new TextDecoder().decode(new Uint8Array(payloadChunk.data))
+      new TextDecoder().decode(pushes[1])
     ) as ClawdbotOverlayData
 
     return payload
