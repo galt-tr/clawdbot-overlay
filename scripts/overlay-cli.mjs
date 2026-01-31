@@ -522,6 +522,24 @@ function deriveWalletAddress(privKey) {
 }
 
 /**
+ * Fetch with timeout using AbortController.
+ * @param {string} url - URL to fetch
+ * @param {Object} options - Fetch options
+ * @param {number} timeoutMs - Timeout in milliseconds (default: 15000)
+ * @returns {Promise<Response>}
+ */
+async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, { ...options, signal: controller.signal });
+    return resp;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
  * Fetch UTXOs for an address from WhatsonChain.
  * @param {string} address - The BSV address
  * @param {number} minValue - Minimum UTXO value (filters dust)
@@ -530,7 +548,7 @@ function deriveWalletAddress(privKey) {
 async function fetchUtxosForAddress(address, minValue = 200) {
   const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
   const wocBase = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
-  const resp = await fetch(`${wocBase}/address/${address}/unspent`);
+  const resp = await fetchWithTimeout(`${wocBase}/address/${address}/unspent`);
   if (!resp.ok) throw new Error(`Failed to fetch UTXOs: ${resp.status}`);
   const utxos = await resp.json();
   return utxos.filter(u => u.value >= minValue);
@@ -680,16 +698,16 @@ async function verifyAndAcceptPayment(payment, minSats, senderKey, serviceId, re
       let currentTxid = result.txid;
       
       for (let depth = 0; depth < 5 && currentTxid; depth++) {
-        const txResp = await fetch(`${wocBase}/tx/${currentTxid}/hex`);
+        const txResp = await fetchWithTimeout(`${wocBase}/tx/${currentTxid}/hex`, {}, 10000);
         if (!txResp.ok) break;
         const txHex = await txResp.text();
         const tx = Transaction.fromHex(txHex);
         
-        const infoResp = await fetch(`${wocBase}/tx/${currentTxid}`);
+        const infoResp = await fetchWithTimeout(`${wocBase}/tx/${currentTxid}`, {}, 10000);
         if (infoResp.ok) {
           const info = await infoResp.json();
           if (info.blockheight && info.confirmations > 0) {
-            const proofResp = await fetch(`${wocBase}/tx/${currentTxid}/proof/tsc`);
+            const proofResp = await fetchWithTimeout(`${wocBase}/tx/${currentTxid}/proof/tsc`, {}, 10000);
             if (proofResp.ok) {
               const proofData = await proofResp.json();
               if (Array.isArray(proofData) && proofData.length > 0) {
