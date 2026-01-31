@@ -1431,9 +1431,129 @@ async function cmdPoll() {
     } else if (msg.type === 'service-request') {
       const serviceId = msg.payload?.serviceId;
       if (serviceId === 'tell-joke') {
-        // Check that payment data exists (soft check for now)
-        const hasPayment = !!(msg.payload?.payment?.beef);
+        // ── Payment verification ──────────────────────────────────
+        // Reject if no payment data
+        const payment = msg.payload?.payment;
+        if (!payment || !payment.beef || !payment.satoshis) {
+          const rejectPayload = {
+            requestId: msg.id,
+            serviceId: 'tell-joke',
+            status: 'rejected',
+            reason: 'No payment included. This service costs 5 sats.',
+          };
+          const rejectSig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+          await fetch(`${OVERLAY_URL}/relay/send`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              from: identityKey,
+              to: msg.from,
+              type: 'service-response',
+              payload: rejectPayload,
+              signature: rejectSig,
+            }),
+          });
+          ackedIds.push(msg.id);
+          processed.push({
+            id: msg.id,
+            type: 'service-request',
+            serviceId: 'tell-joke',
+            action: 'rejected',
+            reason: 'no payment',
+            from: msg.from,
+          });
+          continue;
+        }
 
+        // Reject if underpaying
+        if (payment.satoshis < 5) {
+          const rejectPayload = {
+            requestId: msg.id,
+            serviceId: 'tell-joke',
+            status: 'rejected',
+            reason: `Insufficient payment: ${payment.satoshis} sats sent, 5 required.`,
+          };
+          const rejectSig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+          await fetch(`${OVERLAY_URL}/relay/send`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              from: identityKey,
+              to: msg.from,
+              type: 'service-response',
+              payload: rejectPayload,
+              signature: rejectSig,
+            }),
+          });
+          ackedIds.push(msg.id);
+          processed.push({
+            id: msg.id,
+            type: 'service-request',
+            serviceId: 'tell-joke',
+            action: 'rejected',
+            reason: `underpaid: ${payment.satoshis} < 5`,
+            from: msg.from,
+          });
+          continue;
+        }
+
+        // Verify the BEEF is a valid base64 string and attempt to parse it
+        let beefValid = false;
+        try {
+          const beefBytes = Uint8Array.from(atob(payment.beef), c => c.charCodeAt(0));
+          // Check AtomicBEEF or BEEF magic bytes
+          // AtomicBEEF: 0x01, 0x01, 0x01, 0x01 isn't right — just check length is reasonable
+          if (beefBytes.length > 20) {
+            // Try to parse as Beef to validate structure
+            try {
+              Beef.fromBinary(Array.from(beefBytes));
+              beefValid = true;
+            } catch {
+              // Try as AtomicBEEF
+              try {
+                const tx = Transaction.fromAtomicBEEF(Array.from(beefBytes));
+                beefValid = !!tx;
+              } catch {
+                beefValid = false;
+              }
+            }
+          }
+        } catch {
+          beefValid = false;
+        }
+
+        if (!beefValid) {
+          const rejectPayload = {
+            requestId: msg.id,
+            serviceId: 'tell-joke',
+            status: 'rejected',
+            reason: 'Invalid payment BEEF. Could not parse transaction proof.',
+          };
+          const rejectSig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+          await fetch(`${OVERLAY_URL}/relay/send`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              from: identityKey,
+              to: msg.from,
+              type: 'service-response',
+              payload: rejectPayload,
+              signature: rejectSig,
+            }),
+          });
+          ackedIds.push(msg.id);
+          processed.push({
+            id: msg.id,
+            type: 'service-request',
+            serviceId: 'tell-joke',
+            action: 'rejected',
+            reason: 'invalid BEEF',
+            from: msg.from,
+          });
+          continue;
+        }
+
+        // ── Payment accepted — serve the joke ─────────────────────
         // Pick a random joke
         const joke = JOKES[Math.floor(Math.random() * JOKES.length)];
 
@@ -1443,7 +1563,7 @@ async function cmdPoll() {
           serviceId: 'tell-joke',
           status: 'fulfilled',
           result: joke,
-          paymentAccepted: hasPayment,
+          paymentAccepted: true,
         };
         const respSig = signRelayMessage(privKey, msg.from, 'service-response', responsePayload);
         await fetch(`${OVERLAY_URL}/relay/send`, {
