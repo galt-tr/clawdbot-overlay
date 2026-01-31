@@ -227,22 +227,48 @@ matching service catalog UTXOs.
   //  Private helpers
   // -------------------------------------------------------------------------
 
-  private parseServiceFromScript (script: { chunks: Array<{ op: number; data?: number[] }> }): ClawdbotServiceData | null {
+  private extractOpReturnPushes (script: { chunks: Array<{ op: number; data?: number[] }> }): Uint8Array[] | null {
     const chunks = script.chunks
-    if (chunks.length < 4) return null
-    if (chunks[0].op !== OP.OP_FALSE) return null
-    if (chunks[1].op !== OP.OP_RETURN) return null
 
-    const protocolChunk = chunks[2]
-    if (!protocolChunk.data) return null
-    const protocolStr = new TextDecoder().decode(new Uint8Array(protocolChunk.data))
+    if (chunks.length >= 4 && chunks[0].op === OP.OP_FALSE && chunks[1].op === OP.OP_RETURN) {
+      const pushes: Uint8Array[] = []
+      for (let i = 2; i < chunks.length; i++) {
+        if (chunks[i].data) pushes.push(new Uint8Array(chunks[i].data!))
+      }
+      return pushes
+    }
+
+    if (chunks.length === 2 && chunks[0].op === OP.OP_FALSE && chunks[1].op === OP.OP_RETURN && chunks[1].data) {
+      const blob = chunks[1].data
+      const pushes: Uint8Array[] = []
+      let pos = 0
+      while (pos < blob.length) {
+        const op = blob[pos++]
+        if (op > 0 && op <= 75) {
+          pushes.push(new Uint8Array(blob.slice(pos, pos + op))); pos += op
+        } else if (op === 0x4c) {
+          const len = blob[pos++] ?? 0; pushes.push(new Uint8Array(blob.slice(pos, pos + len))); pos += len
+        } else if (op === 0x4d) {
+          const len = (blob[pos] ?? 0) | ((blob[pos + 1] ?? 0) << 8); pos += 2
+          pushes.push(new Uint8Array(blob.slice(pos, pos + len))); pos += len
+        } else { break }
+      }
+      return pushes.length >= 2 ? pushes : null
+    }
+
+    return null
+  }
+
+  private parseServiceFromScript (script: { chunks: Array<{ op: number; data?: number[] }> }): ClawdbotServiceData | null {
+    const pushes = this.extractOpReturnPushes(script)
+    if (!pushes || pushes.length < 2) return null
+
+    const protocolStr = new TextDecoder().decode(pushes[0])
     if (protocolStr !== PROTOCOL_ID) return null
 
-    const payloadChunk = chunks[3]
-    if (!payloadChunk.data) return null
     try {
       const payload = JSON.parse(
-        new TextDecoder().decode(new Uint8Array(payloadChunk.data))
+        new TextDecoder().decode(pushes[1])
       ) as ClawdbotServiceData
       if (payload.type !== 'service') return null
       return payload
