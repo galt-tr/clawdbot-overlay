@@ -789,19 +789,167 @@ async function cmdRefund(targetAddress) {
 // Payment commands
 // ---------------------------------------------------------------------------
 
+/**
+ * Build a direct P2PKH payment using on-chain UTXOs.
+ * Bypasses wallet-toolbox's internal UTXO management which doesn't work
+ * with externally funded P2PKH addresses.
+ */
+async function buildDirectPayment(recipientPubKey, sats, desc) {
+  // Validate recipient pubkey format
+  if (!/^0[23][0-9a-fA-F]{64}$/.test(recipientPubKey)) {
+    throw new Error('Recipient must be a compressed public key (66 hex chars starting with 02 or 03)');
+  }
+
+  const identityPath = path.join(WALLET_DIR, 'wallet-identity.json');
+  if (!fs.existsSync(identityPath)) {
+    throw new Error('Wallet not initialized. Run: overlay-cli setup');
+  }
+  const identity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
+  const privKey = PrivateKey.fromHex(identity.rootKeyHex);
+  const senderPubKey = privKey.toPublicKey();
+  const senderIdentityKey = identity.identityKey;
+
+  // Derive sender's P2PKH address
+  const senderPubKeyBytes = senderPubKey.encode(true);
+  const senderHash160 = Hash.hash160(senderPubKeyBytes);
+  const prefix = NETWORK === 'mainnet' ? 0x00 : 0x6f;
+  const addrPayload = new Uint8Array([prefix, ...senderHash160]);
+  const checksum = Hash.hash256(Array.from(addrPayload)).slice(0, 4);
+  const addressBytes = new Uint8Array([...addrPayload, ...checksum]);
+  const senderAddress = Utils.toBase58(Array.from(addressBytes));
+
+  // Derive recipient's P2PKH hash from their public key
+  const recipientPubKeyObj = PublicKey.fromString(recipientPubKey);
+  const recipientPubKeyBytes = recipientPubKeyObj.encode(true);
+  const recipientHash160 = Hash.hash160(recipientPubKeyBytes);
+
+  // Fetch UTXOs from WhatsonChain
+  const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
+  const wocBase = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
+
+  const utxoResp = await fetch(`${wocBase}/address/${senderAddress}/unspent`);
+  if (!utxoResp.ok) throw new Error(`Failed to fetch UTXOs: ${utxoResp.status}`);
+  const allUtxos = await utxoResp.json();
+
+  // Filter for usable UTXOs (need enough for payment + fee)
+  const minRequired = sats + 200; // payment + estimated fee
+  const utxos = allUtxos.filter(u => u.value >= minRequired);
+  if (utxos.length === 0) {
+    const totalAvailable = allUtxos.reduce((sum, u) => sum + u.value, 0);
+    throw new Error(`Insufficient funds. Need ${minRequired} sats, have ${totalAvailable} sats available.`);
+  }
+
+  const utxo = utxos[0]; // Use first sufficient UTXO
+
+  // Fetch source transaction
+  const rawResp = await fetch(`${wocBase}/tx/${utxo.tx_hash}/hex`);
+  if (!rawResp.ok) throw new Error(`Failed to fetch source tx: ${rawResp.status}`);
+  const rawTxHex = await rawResp.text();
+  const sourceTx = Transaction.fromHex(rawTxHex);
+
+  // Fetch merkle proof for source tx
+  const txInfoResp = await fetch(`${wocBase}/tx/${utxo.tx_hash}`);
+  const txInfo = await txInfoResp.json();
+  const blockHeight = txInfo.blockheight;
+
+  if (blockHeight && txInfo.confirmations > 0) {
+    const proofResp = await fetch(`${wocBase}/tx/${utxo.tx_hash}/proof/tsc`);
+    if (proofResp.ok) {
+      const proofData = await proofResp.json();
+      if (Array.isArray(proofData) && proofData.length > 0) {
+        const proof = proofData[0];
+        const mpPath = buildMerklePathFromTSC(utxo.tx_hash, proof.index, proof.nodes, blockHeight);
+        sourceTx.merklePath = mpPath;
+      }
+    }
+  }
+
+  // Generate derivation info (for BRC-29 compatibility metadata)
+  const derivationPrefix = Utils.toBase64(Array.from(crypto.getRandomValues(new Uint8Array(8))));
+  const derivationSuffix = Utils.toBase64(Array.from(crypto.getRandomValues(new Uint8Array(8))));
+
+  // Build the payment transaction
+  const tx = new Transaction();
+  tx.addInput({
+    sourceTransaction: sourceTx,
+    sourceOutputIndex: utxo.tx_pos,
+    unlockingScriptTemplate: new P2PKH().unlock(privKey),
+    sequence: 0xffffffff,
+  });
+
+  // Output 0: Payment to recipient
+  tx.addOutput({
+    lockingScript: new P2PKH().lock(recipientHash160),
+    satoshis: sats,
+  });
+
+  // Calculate fee and change
+  const estimatedSize = 148 + 34 * 2 + 10; // 1 input, 2 outputs
+  const fee = Math.max(Math.ceil(estimatedSize * 0.5), 50); // 0.5 sat/byte min
+  const change = utxo.value - sats - fee;
+
+  if (change < 0) {
+    throw new Error(`Insufficient funds after fee. UTXO: ${utxo.value}, payment: ${sats}, fee: ${fee}`);
+  }
+
+  // Output 1: Change back to sender (if dust threshold met)
+  if (change >= 136) { // P2PKH dust threshold
+    tx.addOutput({
+      lockingScript: new P2PKH().lock(senderHash160),
+      satoshis: change,
+    });
+  }
+
+  await tx.sign();
+
+  // Build BEEF
+  const beef = new Beef();
+  beef.mergeTransaction(sourceTx);
+  beef.mergeTransaction(tx);
+
+  const txid = tx.id('hex');
+  const atomicBeefBytes = beef.toBinaryAtomic(txid);
+  const beefBase64 = Utils.toBase64(Array.from(atomicBeefBytes));
+
+  // Broadcast the transaction
+  const broadcastResp = await fetch(`${wocBase}/tx/raw`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ txhex: tx.toHex() }),
+  });
+
+  if (!broadcastResp.ok) {
+    const errText = await broadcastResp.text();
+    throw new Error(`Broadcast failed: ${broadcastResp.status} — ${errText}`);
+  }
+
+  const explorerBase = NETWORK === 'mainnet' ? 'https://whatsonchain.com' : 'https://test.whatsonchain.com';
+
+  return {
+    beef: beefBase64,
+    txid,
+    satoshis: sats,
+    fee,
+    derivationPrefix,
+    derivationSuffix,
+    senderIdentityKey,
+    recipientIdentityKey: recipientPubKey,
+    broadcast: true,
+    explorer: `${explorerBase}/tx/${txid}`,
+  };
+}
+
 async function cmdPay(pubkey, satoshis, description) {
   if (!pubkey || !satoshis) return fail('Usage: pay <pubkey> <satoshis> [description]');
   const sats = parseInt(satoshis, 10);
   if (isNaN(sats) || sats <= 0) return fail('satoshis must be a positive integer');
 
-  const wallet = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
-  const payment = await wallet.createPayment({
-    to: pubkey,
-    satoshis: sats,
-    description: description || undefined,
-  });
-  await wallet.destroy();
-  ok(payment);
+  try {
+    const payment = await buildDirectPayment(pubkey, sats, description || 'agent payment');
+    ok(payment);
+  } catch (err) {
+    fail(err instanceof Error ? err.message : String(err));
+  }
 }
 
 async function cmdVerify(beefBase64) {
