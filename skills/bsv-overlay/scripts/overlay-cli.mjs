@@ -128,14 +128,47 @@ const WOC_API_KEY = process.env.WOC_API_KEY || '';
 const OVERLAY_STATE_DIR = path.join(os.homedir(), '.clawdbot', 'bsv-overlay');
 const PROTOCOL_ID = 'clawdbot-overlay-v1';
 
-/** Fetch from WhatsonChain with optional API key auth */
-function wocFetch(urlPath, options = {}) {
+/** 
+ * Fetch from WhatsonChain with optional API key auth and retry logic.
+ * Retries on 429 (rate limit) and 5xx errors with exponential backoff.
+ * Includes timeout to prevent hanging indefinitely.
+ */
+async function wocFetch(urlPath, options = {}, maxRetries = 3, timeoutMs = 30000) {
   const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
   const base = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
   const url = urlPath.startsWith('http') ? urlPath : `${base}${urlPath}`;
   const headers = { ...(options.headers || {}) };
   if (WOC_API_KEY) headers['Authorization'] = `Bearer ${WOC_API_KEY}`;
-  return fetch(url, { ...options, headers });
+  
+  let lastError;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      // Add timeout via AbortController
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      
+      const resp = await fetch(url, { ...options, headers, signal: controller.signal });
+      clearTimeout(timeout);
+      
+      // Retry on 429 (rate limit) or 5xx (server error)
+      if ((resp.status === 429 || resp.status >= 500) && attempt < maxRetries) {
+        const delayMs = Math.min(1000 * Math.pow(2, attempt), 8000); // 1s, 2s, 4s, 8s max
+        await new Promise(r => setTimeout(r, delayMs));
+        continue;
+      }
+      
+      return resp;
+    } catch (err) {
+      lastError = err;
+      if (attempt < maxRetries) {
+        const delayMs = Math.min(1000 * Math.pow(2, attempt), 8000);
+        await new Promise(r => setTimeout(r, delayMs));
+        continue;
+      }
+    }
+  }
+  
+  throw lastError || new Error('WoC fetch failed after retries');
 }
 const TOPICS = { IDENTITY: 'tm_clawdbot_identity', SERVICES: 'tm_clawdbot_services' };
 const LOOKUP_SERVICES = { AGENTS: 'ls_clawdbot_agents', SERVICES: 'ls_clawdbot_services' };
@@ -168,10 +201,34 @@ function buildOpReturnScript(payload) {
   return script;
 }
 
+/** Default timeout for overlay network calls (ms). */
+const OVERLAY_TIMEOUT = 15000;
+
+/**
+ * Fetch from the overlay server with timeout.
+ * Wraps fetch() with an AbortSignal.timeout to prevent hanging indefinitely
+ * if the overlay server is slow or unreachable. (Issue #29)
+ */
+async function overlayFetch(url, options = {}, timeoutMs = OVERLAY_TIMEOUT) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, { ...options, signal: controller.signal });
+    return resp;
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new Error(`Overlay request timed out after ${timeoutMs}ms: ${url}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 /** Submit BEEF to the overlay. */
 async function submitToOverlay(beefData, topics) {
   const url = `${OVERLAY_URL}/submit`;
-  const response = await fetch(url, {
+  const response = await overlayFetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/octet-stream',
@@ -189,7 +246,7 @@ async function submitToOverlay(beefData, topics) {
 /** Query the overlay via lookup service. */
 async function lookupOverlay(service, query = {}) {
   const url = `${OVERLAY_URL}/lookup`;
-  const response = await fetch(url, {
+  const response = await overlayFetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ service, query }),
@@ -1879,7 +1936,7 @@ async function cmdSend(targetKey, type, payloadStr) {
   const { identityKey, privKey } = loadIdentity();
   const signature = signRelayMessage(privKey, targetKey, type, payload);
 
-  const resp = await fetch(`${OVERLAY_URL}/relay/send`, {
+  const resp = await overlayFetch(`${OVERLAY_URL}/relay/send`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -1905,7 +1962,7 @@ async function cmdInbox(args) {
     if (args[i] === '--since' && args[i + 1]) since = `&since=${args[++i]}`;
   }
 
-  const resp = await fetch(`${OVERLAY_URL}/relay/inbox?identity=${identityKey}${since}`);
+  const resp = await overlayFetch(`${OVERLAY_URL}/relay/inbox?identity=${identityKey}${since}`);
   if (!resp.ok) {
     const body = await resp.text();
     return fail(`Relay inbox failed (${resp.status}): ${body}`);
@@ -1929,7 +1986,7 @@ async function cmdAck(messageIds) {
   }
   const { identityKey } = loadIdentity();
 
-  const resp = await fetch(`${OVERLAY_URL}/relay/ack`, {
+  const resp = await overlayFetch(`${OVERLAY_URL}/relay/ack`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ identity: identityKey, messageIds }),
@@ -1979,7 +2036,7 @@ async function processMessage(msg, identityKey, privKey) {
       originalText: msg.payload?.text || null,
     };
     const pongSig = signRelayMessage(privKey, msg.from, 'pong', pongPayload);
-    await fetch(`${OVERLAY_URL}/relay/send`, {
+    await overlayFetch(`${OVERLAY_URL}/relay/send`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -2060,7 +2117,7 @@ async function processCodeReview(msg, identityKey, privKey) {
       requestId: msg.id, serviceId: 'code-review', status: 'rejected', reason,
     };
     const rejectSig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
-    await fetch(`${OVERLAY_URL}/relay/send`, {
+    await overlayFetch(`${OVERLAY_URL}/relay/send`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -2104,7 +2161,7 @@ async function processCodeReview(msg, identityKey, privKey) {
     ...(acceptError ? { walletError: acceptError } : {}),
   };
   const respSig = signRelayMessage(privKey, msg.from, 'service-response', responsePayload);
-  await fetch(`${OVERLAY_URL}/relay/send`, {
+  await overlayFetch(`${OVERLAY_URL}/relay/send`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -2267,7 +2324,7 @@ async function processWebResearch(msg, identityKey, privKey) {
       reason: 'Missing or invalid query. Send {input: {query: "your question"}}',
     };
     const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
-    await fetch(`${OVERLAY_URL}/relay/send`, {
+    await overlayFetch(`${OVERLAY_URL}/relay/send`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
@@ -2282,7 +2339,7 @@ async function processWebResearch(msg, identityKey, privKey) {
   if (!payResult.accepted) {
     const rejectPayload = { requestId: msg.id, serviceId: 'web-research', status: 'rejected', reason: `Payment rejected: ${payResult.error}. Web research costs ${PRICE} sats.` };
     const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
-    await fetch(`${OVERLAY_URL}/relay/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }) });
+    await overlayFetch(`${OVERLAY_URL}/relay/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }) });
     return { id: msg.id, type: 'service-request', serviceId: 'web-research', action: 'rejected', reason: payResult.error, from: msg.from, ack: true };
   }
 
@@ -3346,7 +3403,7 @@ async function processJokeRequest(msg, identityKey, privKey) {
       requestId: msg.id, serviceId: 'tell-joke', status: 'rejected', reason,
     };
     const rejectSig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
-    await fetch(`${OVERLAY_URL}/relay/send`, {
+    await overlayFetch(`${OVERLAY_URL}/relay/send`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -3382,7 +3439,7 @@ async function processJokeRequest(msg, identityKey, privKey) {
     ...(acceptError ? { walletError: acceptError } : {}),
   };
   const respSig = signRelayMessage(privKey, msg.from, 'service-response', responsePayload);
-  await fetch(`${OVERLAY_URL}/relay/send`, {
+  await overlayFetch(`${OVERLAY_URL}/relay/send`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -3414,7 +3471,7 @@ async function cmdPoll() {
   const { identityKey, privKey } = loadIdentity();
 
   // Fetch inbox
-  const inboxResp = await fetch(`${OVERLAY_URL}/relay/inbox?identity=${identityKey}`);
+  const inboxResp = await overlayFetch(`${OVERLAY_URL}/relay/inbox?identity=${identityKey}`);
   if (!inboxResp.ok) {
     const body = await inboxResp.text();
     return fail(`Relay inbox failed (${inboxResp.status}): ${body}`);
@@ -3441,7 +3498,7 @@ async function cmdPoll() {
 
   // ACK processed messages
   if (ackedIds.length > 0) {
-    await fetch(`${OVERLAY_URL}/relay/ack`, {
+    await overlayFetch(`${OVERLAY_URL}/relay/ack`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ identity: identityKey, messageIds: ackedIds }),
@@ -3514,7 +3571,7 @@ async function cmdConnect() {
           // Ack the message
           if (result.ack) {
             try {
-              await fetch(OVERLAY_URL + '/relay/ack', {
+              await overlayFetch(OVERLAY_URL + '/relay/ack', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ identity: identityKey, messageIds: [result.id] }),
@@ -3614,7 +3671,7 @@ async function cmdResearchRespond(resultJsonPath) {
   };
 
   const sig = signRelayMessage(relayPrivKey, recipientKey, 'service-response', responsePayload);
-  const sendResp = await fetch(`${OVERLAY_URL}/relay/send`, {
+  const sendResp = await overlayFetch(`${OVERLAY_URL}/relay/send`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -3681,8 +3738,8 @@ async function cmdRequestService(targetKey, serviceId, satsStr, inputJsonStr) {
         senderIdentityKey: payment.senderIdentityKey,
       };
     } catch (err) {
-      // Payment failed — send request without payment
-      paymentData = { error: String(err instanceof Error ? err.message : err) };
+      // Issue #28: Abort request if payment fails — don't send unpaid requests
+      return fail(`Payment failed: ${err instanceof Error ? err.message : String(err)}. Service request not sent.`);
     }
   }
 
@@ -3695,7 +3752,7 @@ async function cmdRequestService(targetKey, serviceId, satsStr, inputJsonStr) {
 
   const signature = signRelayMessage(privKey, targetKey, 'service-request', requestPayload);
 
-  const resp = await fetch(`${OVERLAY_URL}/relay/send`, {
+  const resp = await overlayFetch(`${OVERLAY_URL}/relay/send`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
