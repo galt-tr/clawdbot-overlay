@@ -2383,11 +2383,11 @@ async function processTranslate(msg, identityKey, privKey) {
       reason,
     };
     const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
-    await fetch(`${OVERLAY_URL}/relay/send`, {
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
-    });
+    }, 15000);
     return { id: msg.id, type: 'service-request', serviceId: 'translate', action: 'rejected', reason: shortReason, from: msg.from, ack: true };
   }
 
@@ -2413,8 +2413,9 @@ async function processTranslate(msg, identityKey, privKey) {
   let paymentTx = null;
   let isAtomicBeef = false;
   if (beefBytes && beefBytes.length > 20) {
-    try { paymentTx = Transaction.fromAtomicBEEF(Array.from(beefBytes)); isAtomicBeef = true; } catch {}
-    if (!paymentTx) try { const b = Beef.fromBinary(Array.from(beefBytes)); paymentTx = b.txs?.find(t => t.tx)?.tx; } catch {}
+    // Try AtomicBEEF first, then regular BEEF — empty catches are intentional as we try both formats
+    try { paymentTx = Transaction.fromAtomicBEEF(Array.from(beefBytes)); isAtomicBeef = true; } catch { /* expected if not AtomicBEEF */ }
+    if (!paymentTx) try { const b = Beef.fromBinary(Array.from(beefBytes)); paymentTx = b.txs?.find(t => t.tx)?.tx; } catch { /* expected if malformed */ }
   }
   if (!paymentTx) {
     return reject('Invalid payment BEEF.', 'invalid BEEF');
@@ -2422,7 +2423,12 @@ async function processTranslate(msg, identityKey, privKey) {
 
   // ── Find our output & accept payment ──
   const identityPath = path.join(WALLET_DIR, 'wallet-identity.json');
-  const walletIdentity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
+  let walletIdentity;
+  try {
+    walletIdentity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
+  } catch (parseErr) {
+    return reject(`Failed to load wallet identity: ${parseErr.message}`, 'wallet error');
+  }
   const ourPrivKey = PrivateKey.fromHex(walletIdentity.rootKeyHex);
   const ourPubKey = ourPrivKey.toPublicKey();
   const ourHash160 = Hash.hash160(ourPubKey.encode(true));
@@ -2522,14 +2528,14 @@ async function processTranslate(msg, identityKey, privKey) {
     ...(acceptError ? { walletError: acceptError } : {}),
   };
   const respSig = signRelayMessage(privKey, msg.from, 'service-response', responsePayload);
-  await fetch(`${OVERLAY_URL}/relay/send`, {
+  await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       from: identityKey, to: msg.from, type: 'service-response',
       payload: responsePayload, signature: respSig,
     }),
-  });
+  }, 15000);
 
   return {
     id: msg.id,
