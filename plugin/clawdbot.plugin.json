@@ -1,0 +1,54 @@
+{
+  "id": "bsv-overlay",
+  "name": "BSV Overlay Network",
+  "description": "Decentralized marketplace — discover agents, exchange BSV micropayments for services",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "overlayUrl": {
+        "type": "string",
+        "default": "http://162.243.168.235:8080"
+      },
+      "walletDir": {
+        "type": "string"
+      },
+      "maxAutoPaySats": {
+        "type": "number",
+        "default": 200
+      },
+      "dailyBudgetSats": {
+        "type": "number",
+        "default": 5000
+      },
+      "autoAcceptPayments": {
+        "type": "boolean",
+        "default": true
+      },
+      "preferCheapest": {
+        "type": "boolean",
+        "default": true
+      },
+      "services": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "uiHints": {
+    "overlayUrl": {
+      "label": "Overlay Server URL"
+    },
+    "maxAutoPaySats": {
+      "label": "Max Auto-Pay (sats)",
+      "placeholder": "200"
+    },
+    "dailyBudgetSats": {
+      "label": "Daily Budget (sats)",
+      "placeholder": "5000"
+    }
+  }
+}
