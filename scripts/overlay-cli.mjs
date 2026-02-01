@@ -285,37 +285,143 @@ async function buildRealOverlayTransaction(payload, topic) {
   const addressBytes = new Uint8Array([...addrPayload, ...checksum]);
   const walletAddress = Utils.toBase58(Array.from(addressBytes));
 
-  // Try to get a real UTXO from WhatsonChain
+  // === BEEF-first approach: use stored BEEF chain (no WoC, no blocks) ===
+  const beefStorePath = path.join(OVERLAY_STATE_DIR, 'latest-change.json');
+  let storedChange = null;
+  try {
+    if (fs.existsSync(beefStorePath)) {
+      storedChange = JSON.parse(fs.readFileSync(beefStorePath, 'utf-8'));
+    }
+  } catch {}
+
+  if (storedChange && storedChange.txHex && storedChange.satoshis >= 200) {
+    try {
+      return await buildFromStoredBeef(payload, topic, storedChange, privKey, pubKey, hash160);
+    } catch (storedErr) {
+      // Stored BEEF failed — fall through to WoC
+      console.error(`[buildTx] Stored BEEF failed: ${storedErr.message}`);
+    }
+  }
+
+  // === Fallback: WoC UTXO lookup (needs confirmed tx with proof) ===
   const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
   const wocBase = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
-
   let utxos = [];
   try {
     const resp = await wocFetch(`/address/${walletAddress}/unspent`);
     if (resp.ok) utxos = await resp.json();
-  } catch { /* fallback to synthetic */ }
-
-  // Filter out dust — need at least enough for fee
+  } catch {}
   utxos = utxos.filter(u => u.value >= 200);
 
   if (utxos.length > 0) {
-    // === REAL FUNDED TRANSACTION ===
     try {
       return await buildRealFundedTx(payload, topic, utxos[0], privKey, pubKey, hash160, walletAddress, wocBase);
     } catch (realErr) {
-      // WoC UTXO may be stale (already spent in overlay but not on-chain)
-      // Fall through to wallet createAction
+      // Fall through
     }
   }
 
-  // === FALLBACK: Try wallet's internal createAction ===
-  // This works if the wallet DB has spendable outputs (including unconfirmed change)
+  // === Last resort: wallet createAction or synthetic ===
   try {
     return await buildWalletCreateActionTx(payload, topic, identity);
   } catch (walletErr) {
-    // Last resort: synthetic funding (works with SCRIPTS_ONLY=true on overlay)
     return buildSyntheticTx(payload, privKey, pubKey);
   }
+}
+
+/** Save the change output's full tx chain for instant reuse (no WoC, no blocks needed) */
+function saveChangeBeef(tx, changeSats, changeVout) {
+  const beefStorePath = path.join(OVERLAY_STATE_DIR, 'latest-change.json');
+  try {
+    fs.mkdirSync(OVERLAY_STATE_DIR, { recursive: true });
+    fs.writeFileSync(beefStorePath, JSON.stringify({
+      txHex: tx.toHex(),
+      txid: tx.id('hex'),
+      vout: changeVout,
+      satoshis: changeSats,
+      // Store the full source chain as hex for reconstruction
+      sourceChain: serializeSourceChain(tx),
+      savedAt: new Date().toISOString(),
+    }));
+  } catch {}
+}
+
+/** Serialize the tx's input source chain (for BEEF reconstruction) */
+function serializeSourceChain(tx) {
+  const chain = [];
+  let cur = tx;
+  for (let depth = 0; depth < 15; depth++) {
+    const src = cur.inputs?.[0]?.sourceTransaction;
+    if (!src) break;
+    const entry = { txHex: src.toHex(), txid: src.id('hex') };
+    if (src.merklePath) {
+      entry.merklePathHex = Array.from(src.merklePath.toBinary()).map(b => b.toString(16).padStart(2, '0')).join('');
+      entry.blockHeight = src.merklePath.blockHeight;
+    }
+    chain.push(entry);
+    cur = src;
+  }
+  return chain;
+}
+
+/** Reconstruct a tx with its full source chain from stored data */
+function reconstructFromChain(storedChange) {
+  const tx = Transaction.fromHex(storedChange.txHex);
+
+  // Rebuild source chain
+  if (storedChange.sourceChain && storedChange.sourceChain.length > 0) {
+    let childTx = tx;
+    for (const entry of storedChange.sourceChain) {
+      const srcTx = Transaction.fromHex(entry.txHex);
+      if (entry.merklePathHex) {
+        const mpBytes = entry.merklePathHex.match(/.{2}/g).map(h => parseInt(h, 16));
+        srcTx.merklePath = MerklePath.fromBinary(mpBytes);
+      }
+      childTx.inputs[0].sourceTransaction = srcTx;
+      childTx = srcTx;
+    }
+  }
+  return tx;
+}
+
+/** Build a tx using a stored BEEF chain (instant, no WoC needed) */
+async function buildFromStoredBeef(payload, topic, storedChange, privKey, pubKey, hash160) {
+  const sourceTx = reconstructFromChain(storedChange);
+
+  const opReturnScript = buildOpReturnScript(payload);
+  const tx = new Transaction();
+  tx.addInput({
+    sourceTransaction: sourceTx,
+    sourceOutputIndex: storedChange.vout,
+    unlockingScriptTemplate: new P2PKH().unlock(privKey),
+    sequence: 0xffffffff,
+  });
+  tx.addOutput({ lockingScript: opReturnScript, satoshis: 0 });
+
+  const fee = 200;
+  const changeSats = storedChange.satoshis - fee;
+  const changeVout = changeSats > 0 ? 1 : -1;
+  if (changeSats > 0) {
+    tx.addOutput({ lockingScript: new P2PKH().lock(Array.from(hash160)), satoshis: changeSats });
+  }
+
+  await tx.sign();
+  const txid = tx.id('hex');
+
+  // Build BEEF — auto-follows sourceTransaction links
+  const beefObj = new Beef();
+  beefObj.mergeTransaction(tx);
+  const beef = beefObj.toBinary();
+
+  // Submit to overlay
+  const steak = await submitToOverlay(beef, [topic]);
+
+  // Save this tx's change for next time
+  if (changeSats > 0) {
+    saveChangeBeef(tx, changeSats, 1);
+  }
+
+  return { txid, beef, steak, funded: 'stored-beef', changeSats };
 }
 
 /** Build a real funded transaction using WoC UTXO */
@@ -408,12 +514,13 @@ async function buildRealFundedTx(payload, topic, utxo, privKey, pubKey, hash160,
   // Submit to overlay
   const steak = await submitToOverlay(beef, [topic]);
 
-  // Import the change output back into the wallet (if it exists)
+  // Save the change BEEF for instant chaining (no WoC needed next time)
   if (changeSats > 0) {
+    saveChangeBeef(tx, changeSats, 1);
     try {
       await importChangeOutput(txid, tx, changeSats, 1);
     } catch (importErr) {
-      // Non-fatal — change will be picked up by WoC next time
+      // Non-fatal — BEEF store handles this now
     }
   }
 
