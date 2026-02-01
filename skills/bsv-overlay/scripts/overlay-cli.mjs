@@ -108,12 +108,35 @@ const { PrivateKey, PublicKey, Hash, Utils, Transaction, Script, P2PKH, Beef, Me
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
+
+// Auto-load .env from overlay state dir if it exists
+const _overlayEnvPath = path.join(os.homedir(), '.clawdbot', 'bsv-overlay', '.env');
+try {
+  if (fs.existsSync(_overlayEnvPath)) {
+    for (const line of fs.readFileSync(_overlayEnvPath, 'utf-8').split('\n')) {
+      const match = line.match(/^([A-Z_]+)=(.+)$/);
+      if (match && !process.env[match[1]]) process.env[match[1]] = match[2].trim();
+    }
+  }
+} catch {}
+
 const WALLET_DIR = process.env.BSV_WALLET_DIR
   || path.join(os.homedir(), '.clawdbot', 'bsv-wallet');
 const NETWORK = process.env.BSV_NETWORK || 'mainnet';
 const OVERLAY_URL = process.env.OVERLAY_URL || 'http://162.243.168.235:8080';
+const WOC_API_KEY = process.env.WOC_API_KEY || '';
 const OVERLAY_STATE_DIR = path.join(os.homedir(), '.clawdbot', 'bsv-overlay');
 const PROTOCOL_ID = 'clawdbot-overlay-v1';
+
+/** Fetch from WhatsonChain with optional API key auth */
+function wocFetch(urlPath, options = {}) {
+  const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
+  const base = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
+  const url = urlPath.startsWith('http') ? urlPath : `${base}${urlPath}`;
+  const headers = { ...(options.headers || {}) };
+  if (WOC_API_KEY) headers['Authorization'] = `Bearer ${WOC_API_KEY}`;
+  return fetch(url, { ...options, headers });
+}
 const TOPICS = { IDENTITY: 'tm_clawdbot_identity', SERVICES: 'tm_clawdbot_services' };
 const LOOKUP_SERVICES = { AGENTS: 'ls_clawdbot_agents', SERVICES: 'ls_clawdbot_services' };
 
@@ -262,57 +285,196 @@ async function buildRealOverlayTransaction(payload, topic) {
   const addressBytes = new Uint8Array([...addrPayload, ...checksum]);
   const walletAddress = Utils.toBase58(Array.from(addressBytes));
 
-  // Try to get a real UTXO from WhatsonChain
+  // === BEEF-first approach: use stored BEEF chain (no WoC, no blocks) ===
+  const beefStorePath = path.join(OVERLAY_STATE_DIR, 'latest-change.json');
+  let storedChange = null;
+  try {
+    if (fs.existsSync(beefStorePath)) {
+      storedChange = JSON.parse(fs.readFileSync(beefStorePath, 'utf-8'));
+    }
+  } catch {}
+
+  if (storedChange && storedChange.txHex && storedChange.satoshis >= 200) {
+    try {
+      return await buildFromStoredBeef(payload, topic, storedChange, privKey, pubKey, hash160);
+    } catch (storedErr) {
+      // Stored BEEF failed — fall through to WoC
+      console.error(`[buildTx] Stored BEEF failed: ${storedErr.message}`);
+    }
+  }
+
+  // === Fallback: WoC UTXO lookup (needs confirmed tx with proof) ===
   const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
   const wocBase = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
-
   let utxos = [];
   try {
-    const resp = await fetch(`${wocBase}/address/${walletAddress}/unspent`);
+    const resp = await wocFetch(`/address/${walletAddress}/unspent`);
     if (resp.ok) utxos = await resp.json();
-  } catch { /* fallback to synthetic */ }
-
-  // Filter out dust — need at least enough for fee
+  } catch {}
   utxos = utxos.filter(u => u.value >= 200);
 
   if (utxos.length > 0) {
-    // === REAL FUNDED TRANSACTION ===
-    return await buildRealFundedTx(payload, topic, utxos[0], privKey, pubKey, hash160, walletAddress, wocBase);
+    try {
+      return await buildRealFundedTx(payload, topic, utxos[0], privKey, pubKey, hash160, walletAddress, wocBase);
+    } catch (realErr) {
+      // Fall through
+    }
   }
 
-  // === FALLBACK: Try wallet's internal createAction ===
-  // This works if the wallet DB has spendable outputs
+  // === Last resort: wallet createAction or synthetic ===
   try {
     return await buildWalletCreateActionTx(payload, topic, identity);
   } catch (walletErr) {
-    // Last resort: synthetic funding (works with SCRIPTS_ONLY=true on overlay)
     return buildSyntheticTx(payload, privKey, pubKey);
   }
+}
+
+/** Save the change output's full tx chain for instant reuse (no WoC, no blocks needed) */
+function saveChangeBeef(tx, changeSats, changeVout) {
+  const beefStorePath = path.join(OVERLAY_STATE_DIR, 'latest-change.json');
+  try {
+    fs.mkdirSync(OVERLAY_STATE_DIR, { recursive: true });
+    fs.writeFileSync(beefStorePath, JSON.stringify({
+      txHex: tx.toHex(),
+      txid: tx.id('hex'),
+      vout: changeVout,
+      satoshis: changeSats,
+      // Store the full source chain as hex for reconstruction
+      sourceChain: serializeSourceChain(tx),
+      savedAt: new Date().toISOString(),
+    }));
+  } catch {}
+}
+
+/** Serialize the tx's input source chain (for BEEF reconstruction) */
+function serializeSourceChain(tx) {
+  const chain = [];
+  let cur = tx;
+  for (let depth = 0; depth < 15; depth++) {
+    const src = cur.inputs?.[0]?.sourceTransaction;
+    if (!src) break;
+    const entry = { txHex: src.toHex(), txid: src.id('hex') };
+    if (src.merklePath) {
+      entry.merklePathHex = Array.from(src.merklePath.toBinary()).map(b => b.toString(16).padStart(2, '0')).join('');
+      entry.blockHeight = src.merklePath.blockHeight;
+    }
+    chain.push(entry);
+    cur = src;
+  }
+  return chain;
+}
+
+/** Reconstruct a tx with its full source chain from stored data */
+function reconstructFromChain(storedChange) {
+  const tx = Transaction.fromHex(storedChange.txHex);
+
+  // Rebuild source chain
+  if (storedChange.sourceChain && storedChange.sourceChain.length > 0) {
+    let childTx = tx;
+    for (const entry of storedChange.sourceChain) {
+      const srcTx = Transaction.fromHex(entry.txHex);
+      if (entry.merklePathHex) {
+        const mpBytes = entry.merklePathHex.match(/.{2}/g).map(h => parseInt(h, 16));
+        srcTx.merklePath = MerklePath.fromBinary(mpBytes);
+      }
+      childTx.inputs[0].sourceTransaction = srcTx;
+      childTx = srcTx;
+    }
+  }
+  return tx;
+}
+
+/** Build a tx using a stored BEEF chain (instant, no WoC needed) */
+async function buildFromStoredBeef(payload, topic, storedChange, privKey, pubKey, hash160) {
+  const sourceTx = reconstructFromChain(storedChange);
+
+  const opReturnScript = buildOpReturnScript(payload);
+  const tx = new Transaction();
+  tx.addInput({
+    sourceTransaction: sourceTx,
+    sourceOutputIndex: storedChange.vout,
+    unlockingScriptTemplate: new P2PKH().unlock(privKey),
+    sequence: 0xffffffff,
+  });
+  tx.addOutput({ lockingScript: opReturnScript, satoshis: 0 });
+
+  const fee = 200;
+  const changeSats = storedChange.satoshis - fee;
+  const changeVout = changeSats > 0 ? 1 : -1;
+  if (changeSats > 0) {
+    tx.addOutput({ lockingScript: new P2PKH().lock(Array.from(hash160)), satoshis: changeSats });
+  }
+
+  await tx.sign();
+  const txid = tx.id('hex');
+
+  // Build BEEF — auto-follows sourceTransaction links
+  const beefObj = new Beef();
+  beefObj.mergeTransaction(tx);
+  const beef = beefObj.toBinary();
+
+  // Submit to overlay
+  const steak = await submitToOverlay(beef, [topic]);
+
+  // Save this tx's change for next time
+  if (changeSats > 0) {
+    saveChangeBeef(tx, changeSats, 1);
+  }
+
+  return { txid, beef, steak, funded: 'stored-beef', changeSats };
 }
 
 /** Build a real funded transaction using WoC UTXO */
 async function buildRealFundedTx(payload, topic, utxo, privKey, pubKey, hash160, walletAddress, wocBase) {
   // Fetch raw source tx
-  const rawResp = await fetch(`${wocBase}/tx/${utxo.tx_hash}/hex`);
+  const rawResp = await wocFetch(`/tx/${utxo.tx_hash}/hex`);
   if (!rawResp.ok) throw new Error(`Failed to fetch source tx: ${rawResp.status}`);
   const rawTxHex = await rawResp.text();
   const sourceTx = Transaction.fromHex(rawTxHex);
 
   // Fetch merkle proof for the source tx
-  const txInfoResp = await fetch(`${wocBase}/tx/${utxo.tx_hash}`);
+  const txInfoResp = await wocFetch(`/tx/${utxo.tx_hash}`);
   const txInfo = await txInfoResp.json();
   const blockHeight = txInfo.blockheight;
 
-  if (blockHeight && txInfo.confirmations > 0) {
-    const proofResp = await fetch(`${wocBase}/tx/${utxo.tx_hash}/proof/tsc`);
-    if (proofResp.ok) {
-      const proofData = await proofResp.json();
-      if (Array.isArray(proofData) && proofData.length > 0) {
-        const proof = proofData[0];
-        const mpPath = buildMerklePathFromTSC(utxo.tx_hash, proof.index, proof.nodes, blockHeight);
-        sourceTx.merklePath = mpPath;
+  // Walk the source chain back to a confirmed tx with merkle proof.
+  // Each unconfirmed tx needs its sourceTransaction linked for BEEF building.
+  const txChain = []; // will contain [sourceTx, ..., provenAncestor] newest-first
+  let curTx = sourceTx;
+  let curTxid = utxo.tx_hash;
+  let curHeight = blockHeight;
+  let curConf = txInfo.confirmations;
+
+  for (let depth = 0; depth < 10; depth++) {
+    if (curHeight && curConf > 0) {
+      // Confirmed tx — attach merkle proof
+      const proofResp = await wocFetch(`/tx/${curTxid}/proof/tsc`);
+      if (proofResp.ok) {
+        const proofData = await proofResp.json();
+        if (Array.isArray(proofData) && proofData.length > 0) {
+          const proof = proofData[0];
+          curTx.merklePath = buildMerklePathFromTSC(curTxid, proof.index, proof.nodes, curHeight);
+        }
       }
+      txChain.push(curTx);
+      break; // Found a proven tx, stop walking
     }
+    // Unconfirmed — walk to its first input's source
+    txChain.push(curTx);
+    const parentTxid = curTx.inputs[0]?.sourceTXID;
+    if (!parentTxid) break;
+    const parentHexResp = await wocFetch(`/tx/${parentTxid}/hex`);
+    if (!parentHexResp.ok) break;
+    const parentTx = Transaction.fromHex(await parentHexResp.text());
+    // Link the child's input to the parent Transaction object
+    curTx.inputs[0].sourceTransaction = parentTx;
+    const parentInfoResp = await wocFetch(`/tx/${parentTxid}`);
+    if (!parentInfoResp.ok) break;
+    const parentInfo = await parentInfoResp.json();
+    curTx = parentTx;
+    curTxid = parentTxid;
+    curHeight = parentInfo.blockheight;
+    curConf = parentInfo.confirmations;
   }
 
   // Build the OP_RETURN transaction
@@ -341,18 +503,24 @@ async function buildRealFundedTx(payload, topic, utxo, privKey, pubKey, hash160,
   }
 
   await tx.sign();
-  const beef = tx.toBEEF();
   const txid = tx.id('hex');
+
+  // Build BEEF — mergeTransaction auto-follows sourceTransaction links
+  const srcTxRef = tx.inputs[0]?.sourceTransaction;
+  const beefObj = new Beef();
+  beefObj.mergeTransaction(tx);
+  const beef = beefObj.toBinary();
 
   // Submit to overlay
   const steak = await submitToOverlay(beef, [topic]);
 
-  // Import the change output back into the wallet (if it exists)
+  // Save the change BEEF for instant chaining (no WoC needed next time)
   if (changeSats > 0) {
+    saveChangeBeef(tx, changeSats, 1);
     try {
       await importChangeOutput(txid, tx, changeSats, 1);
     } catch (importErr) {
-      // Non-fatal — change will be picked up by WoC next time
+      // Non-fatal — BEEF store handles this now
     }
   }
 
@@ -460,8 +628,14 @@ async function buildWalletCreateActionTx(payload, topic, identity) {
   }
 }
 
-/** Synthetic (unfunded) transaction — works only with SCRIPTS_ONLY overlay */
+/** Synthetic (unfunded) transaction — works only with SCRIPTS_ONLY overlay.
+ *  Issue #6: Blocked on mainnet unless ALLOW_SYNTHETIC=true env var is set. */
 function buildSyntheticTx(payload, privKey, pubKey) {
+  // Guard: never use synthetic funding on mainnet without explicit opt-in
+  if (NETWORK === 'mainnet' && process.env.ALLOW_SYNTHETIC !== 'true') {
+    throw new Error('No funds available. Import a UTXO first: overlay-cli import <txid>');
+  }
+  console.error(`[buildSyntheticTx] WARNING: Using synthetic (fabricated) funding on ${NETWORK}. This creates fake merkle proofs.`);
   const pubKeyHashHex = pubKey.toHash('hex');
   const pubKeyHash = [];
   for (let i = 0; i < pubKeyHashHex.length; i += 2) {
@@ -497,6 +671,189 @@ function buildSyntheticTx(payload, privKey, pubKey) {
   const beef = tx.toBEEF();
   const txid = tx.id('hex');
   return { txid, beef, funded: 'synthetic' };
+}
+
+// ---------------------------------------------------------------------------
+// Shared Payment Verification Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Derive a P2PKH address from a private key.
+ * Centralizes address derivation logic used across multiple functions.
+ * @param {PrivateKey} privKey - The private key
+ * @returns {{ address: string, hash160: Uint8Array, pubKey: PublicKey }}
+ */
+function deriveWalletAddress(privKey) {
+  const pubKey = privKey.toPublicKey();
+  const pubKeyBytes = pubKey.encode(true);
+  const hash160 = Hash.hash160(pubKeyBytes);
+  const prefix = NETWORK === 'mainnet' ? 0x00 : 0x6f;
+  const addrPayload = new Uint8Array([prefix, ...hash160]);
+  const checksum = Hash.hash256(Array.from(addrPayload)).slice(0, 4);
+  const addressBytes = new Uint8Array([...addrPayload, ...checksum]);
+  const address = Utils.toBase58(Array.from(addressBytes));
+  return { address, hash160, pubKey };
+}
+
+/**
+ * Fetch with timeout using AbortController.
+ * @param {string} url - URL to fetch
+ * @param {Object} options - Fetch options
+ * @param {number} timeoutMs - Timeout in milliseconds (default: 15000)
+ * @returns {Promise<Response>}
+ */
+async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, { ...options, signal: controller.signal });
+    return resp;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
+ * Fetch UTXOs for an address from WhatsonChain.
+ * @param {string} address - The BSV address
+ * @param {number} minValue - Minimum UTXO value (filters dust)
+ * @returns {Promise<Array>} Array of UTXOs with { tx_hash, tx_pos, value }
+ */
+async function fetchUtxosForAddress(address, minValue = 200) {
+  const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
+  const wocBase = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
+  const resp = await fetchWithTimeout(`${wocBase}/address/${address}/unspent`);
+  if (!resp.ok) throw new Error(`Failed to fetch UTXOs: ${resp.status}`);
+  const utxos = await resp.json();
+  return utxos.filter(u => u.value >= minValue);
+}
+
+/**
+ * Verify and accept a payment from BEEF data.
+ * Handles BEEF decoding, tx parsing, output matching, amount verification,
+ * and wallet internalization with WoC fallback.
+ * 
+ * @param {Object} payment - Payment object with beef, satoshis, derivationPrefix, derivationSuffix
+ * @param {number} minSats - Minimum required satoshis
+ * @param {string} senderKey - Sender's identity key
+ * @param {string} serviceId - Service identifier for description
+ * @param {Uint8Array} recipientHash160 - Recipient's pubkey hash
+ * @returns {Promise<{ accepted: boolean, txid: string, satoshis: number, outputIndex: number, walletAccepted: boolean, error?: string }>}
+ */
+async function verifyAndAcceptPayment(payment, minSats, senderKey, serviceId, recipientHash160) {
+  const result = {
+    accepted: false,
+    txid: null,
+    satoshis: 0,
+    outputIndex: -1,
+    walletAccepted: false,
+    error: null,
+  };
+
+  // Validate payment object
+  if (!payment || !payment.beef || !payment.satoshis) {
+    result.error = 'no payment';
+    return result;
+  }
+  if (payment.satoshis < minSats) {
+    result.error = `underpaid: ${payment.satoshis} < ${minSats}`;
+    return result;
+  }
+
+  // Decode BEEF
+  let beefBytes;
+  try {
+    beefBytes = Uint8Array.from(atob(payment.beef), c => c.charCodeAt(0));
+  } catch {
+    result.error = 'invalid base64';
+    return result;
+  }
+
+  if (!beefBytes || beefBytes.length < 20) {
+    result.error = 'invalid beef length';
+    return result;
+  }
+
+  // Parse the payment transaction (try AtomicBEEF first, then regular BEEF)
+  let paymentTx = null;
+  let isAtomicBeef = false;
+  
+  try {
+    paymentTx = Transaction.fromAtomicBEEF(beefBytes);
+    isAtomicBeef = true;
+  } catch {
+    try {
+      const beefObj = Beef.fromBinary(Array.from(beefBytes));
+      paymentTx = beefObj.txs[beefObj.txs.length - 1];
+    } catch (e2) {
+      result.error = `beef parse failed: ${e2.message}`;
+      return result;
+    }
+  }
+
+  // Find the output paying us
+  let paymentOutputIndex = -1;
+  let paymentSats = 0;
+  
+  for (let i = 0; i < paymentTx.outputs.length; i++) {
+    const out = paymentTx.outputs[i];
+    const chunks = out.lockingScript?.chunks || [];
+    
+    // Standard P2PKH: OP_DUP OP_HASH160 <20-byte hash> OP_EQUALVERIFY OP_CHECKSIG
+    if (chunks.length === 5 && 
+        chunks[0].op === 0x76 && chunks[1].op === 0xa9 &&
+        chunks[2].data?.length === 20 &&
+        chunks[3].op === 0x88 && chunks[4].op === 0xac) {
+      const scriptHash = new Uint8Array(chunks[2].data);
+      if (scriptHash.length === recipientHash160.length &&
+          scriptHash.every((b, idx) => b === recipientHash160[idx])) {
+        paymentOutputIndex = i;
+        paymentSats = out.satoshis;
+        break;
+      }
+    }
+  }
+
+  if (paymentOutputIndex < 0) {
+    result.error = 'no matching output';
+    return result;
+  }
+  if (paymentSats < minSats) {
+    result.error = `output underpaid: ${paymentSats} < ${minSats}`;
+    return result;
+  }
+
+  result.txid = paymentTx.id('hex');
+  result.satoshis = paymentSats;
+  result.outputIndex = paymentOutputIndex;
+  result.accepted = true;
+
+  // ── Accept payment: store the BEEF for later spending ──
+  // The sender's BEEF contains the full proof chain. We just need to save it
+  // so we can spend this output later (BEEF-first approach, no WoC needed).
+  try {
+    // Store the received payment BEEF as a spendable UTXO
+    const paymentStorePath = path.join(OVERLAY_STATE_DIR, 'received-payments.jsonl');
+    fs.mkdirSync(OVERLAY_STATE_DIR, { recursive: true });
+
+    // Reconstruct the payment tx with its source chain from the BEEF
+    // The sender's BEEF has the full ancestry — preserve it
+    const entry = {
+      txid: result.txid,
+      vout: paymentOutputIndex,
+      satoshis: paymentSats,
+      beefBase64: payment.beef,  // Keep the original BEEF from sender
+      serviceId,
+      from: senderKey,
+      ts: Date.now(),
+    };
+    fs.appendFileSync(paymentStorePath, JSON.stringify(entry) + '\n');
+    result.walletAccepted = true;
+  } catch (err) {
+    result.error = `payment store failed: ${err.message}`;
+  }
+
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +908,11 @@ async function cmdSetup() {
   const wallet = await BSVAgentWallet.create({ network: NETWORK, storageDir: WALLET_DIR });
   const identityKey = await wallet.getIdentityKey();
   await wallet.destroy();
+  // Issue #8: Restrict permissions on wallet-identity.json (contains private key)
+  const newIdentityPath = path.join(WALLET_DIR, 'wallet-identity.json');
+  if (fs.existsSync(newIdentityPath)) {
+    fs.chmodSync(newIdentityPath, 0o600);
+  }
   ok({
     identityKey,
     walletDir: WALLET_DIR,
@@ -614,7 +976,7 @@ async function cmdBalance() {
     const address = Utils.toBase58(Array.from(addressBytes));
 
     const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
-    const resp = await fetch(`https://api.whatsonchain.com/v1/bsv/${wocNet}/address/${address}/balance`);
+    const resp = await wocFetch(`/address/${address}/balance`);
     if (resp.ok) {
       const bal = await resp.json();
       onChain = {
@@ -639,7 +1001,7 @@ async function cmdImport(txidArg, voutStr) {
   const wocBase = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
 
   // Check confirmation status
-  const txInfoResp = await fetch(`${wocBase}/tx/${txid}`);
+  const txInfoResp = await wocFetch(`/tx/${txid}`);
   if (!txInfoResp.ok) return fail(`Failed to fetch tx info: ${txInfoResp.status}`);
   const txInfo = await txInfoResp.json();
 
@@ -649,7 +1011,7 @@ async function cmdImport(txidArg, voutStr) {
   const blockHeight = txInfo.blockheight;
 
   // Fetch raw tx
-  const rawTxResp = await fetch(`${wocBase}/tx/${txid}/hex`);
+  const rawTxResp = await wocFetch(`/tx/${txid}/hex`);
   if (!rawTxResp.ok) return fail(`Failed to fetch raw tx: ${rawTxResp.status}`);
   const rawTxHex = await rawTxResp.text();
   const sourceTx = Transaction.fromHex(rawTxHex);
@@ -657,7 +1019,7 @@ async function cmdImport(txidArg, voutStr) {
   if (!output) return fail(`Output index ${vout} not found (tx has ${sourceTx.outputs.length} outputs)`);
 
   // Fetch TSC merkle proof
-  const proofResp = await fetch(`${wocBase}/tx/${txid}/proof/tsc`);
+  const proofResp = await wocFetch(`/tx/${txid}/proof/tsc`);
   if (!proofResp.ok) return fail(`Failed to fetch merkle proof: ${proofResp.status}`);
   const proofData = await proofResp.json();
   if (!Array.isArray(proofData) || proofData.length === 0) return fail('No merkle proof available');
@@ -728,23 +1090,47 @@ async function cmdRefund(targetAddress) {
   const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
   const wocBase = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
 
-  const utxoResp = await fetch(`${wocBase}/address/${sourceAddress}/unspent`);
+  // Refund sweeps all funds — needs WoC to discover all UTXOs (manual command)
+  const utxoResp = await wocFetch(`/address/${sourceAddress}/unspent`);
   if (!utxoResp.ok) return fail(`Failed to fetch UTXOs: ${utxoResp.status}`);
   const utxos = await utxoResp.json();
   if (!utxos || utxos.length === 0) return fail(`No UTXOs found for ${sourceAddress}`);
 
-  const sourceTxCache = {};
-  for (const utxo of utxos) {
-    if (!sourceTxCache[utxo.tx_hash]) {
-      const txResp = await fetch(`${wocBase}/tx/${utxo.tx_hash}/hex`);
-      if (!txResp.ok) return fail(`Failed to fetch source tx ${utxo.tx_hash}`);
-      sourceTxCache[utxo.tx_hash] = await txResp.text();
+  // Also include stored BEEF change if available (may not be on-chain yet)
+  const beefStorePath = path.join(OVERLAY_STATE_DIR, 'latest-change.json');
+  let storedBeefTx = null;
+  let storedBeefIncluded = false;
+  try {
+    if (fs.existsSync(beefStorePath)) {
+      const stored = JSON.parse(fs.readFileSync(beefStorePath, 'utf-8'));
+      if (stored.satoshis > 0 && !utxos.some(u => u.tx_hash === stored.txid)) {
+        storedBeefTx = { stored, tx: reconstructFromChain(stored) };
+      }
     }
-  }
+  } catch {}
 
   const tx = new Transaction();
   let totalInput = 0;
+
+  // Add stored BEEF input first (has full source chain, no WoC needed)
+  if (storedBeefTx) {
+    tx.addInput({
+      sourceTransaction: storedBeefTx.tx,
+      sourceOutputIndex: storedBeefTx.stored.vout,
+      unlockingScriptTemplate: new P2PKH().unlock(privKey),
+    });
+    totalInput += storedBeefTx.stored.satoshis;
+    storedBeefIncluded = true;
+  }
+
+  // Add WoC UTXOs
+  const sourceTxCache = {};
   for (const utxo of utxos) {
+    if (!sourceTxCache[utxo.tx_hash]) {
+      const txResp = await wocFetch(`/tx/${utxo.tx_hash}/hex`);
+      if (!txResp.ok) continue; // skip on error, non-fatal for sweep
+      sourceTxCache[utxo.tx_hash] = await txResp.text();
+    }
     const srcTx = Transaction.fromHex(sourceTxCache[utxo.tx_hash]);
     tx.addInput({
       sourceTransaction: srcTx,
@@ -754,6 +1140,8 @@ async function cmdRefund(targetAddress) {
     totalInput += utxo.value;
   }
 
+  if (totalInput === 0) return fail('No spendable funds found');
+
   const targetDecoded = Utils.fromBase58(targetAddress);
   const targetHash160 = targetDecoded.slice(1, 21);
   tx.addOutput({
@@ -761,33 +1149,39 @@ async function cmdRefund(targetAddress) {
     satoshis: totalInput,
   });
 
-  const estimatedSize = utxos.length * 148 + 34 + 10;
+  const inputCount = tx.inputs.length;
+  const estimatedSize = inputCount * 148 + 34 + 10;
   const fee = Math.max(Math.ceil(estimatedSize / 1000), 100);
   if (totalInput <= fee) return fail(`Total value (${totalInput} sats) ≤ fee (${fee} sats)`);
   tx.outputs[0].satoshis = totalInput - fee;
 
   await tx.sign();
-  const rawTxHex = tx.toHex();
   const txid = tx.id('hex');
 
-  const broadcastResp = await fetch(`${wocBase}/tx/raw`, {
+  // Broadcast (required for refund — funds leave the overlay)
+  const broadcastResp = await wocFetch(`/tx/raw`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ txhex: rawTxHex }),
+    body: JSON.stringify({ txhex: tx.toHex() }),
   });
 
   if (!broadcastResp.ok) {
     const errText = await broadcastResp.text();
     return fail(`Broadcast failed: ${broadcastResp.status} — ${errText}`);
   }
+
+  // Clear stored BEEF since we swept everything
+  try { fs.unlinkSync(beefStorePath); } catch {}
+
   const broadcastResult = await broadcastResp.text();
   const explorerBase = NETWORK === 'mainnet' ? 'https://whatsonchain.com' : 'https://test.whatsonchain.com';
 
   ok({
     txid: broadcastResult.replace(/"/g, '').trim(),
     satoshisSent: totalInput - fee,
-    fee, inputCount: utxos.length, totalInput,
+    fee, inputCount, totalInput,
     from: sourceAddress, to: targetAddress,
+    storedBeefIncluded,
     network: NETWORK,
     explorer: `${explorerBase}/tx/${txid}`,
   });
@@ -831,44 +1225,62 @@ async function buildDirectPayment(recipientPubKey, sats, desc) {
   const recipientPubKeyBytes = recipientPubKeyObj.encode(true);
   const recipientHash160 = Hash.hash160(recipientPubKeyBytes);
 
-  // Fetch UTXOs from WhatsonChain
-  const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
-  const wocBase = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
+  // ── BEEF-first: use stored change output (no WoC calls) ──
+  const beefStorePath = path.join(OVERLAY_STATE_DIR, 'latest-change.json');
+  let sourceTx = null;
+  let sourceVout = -1;
+  let sourceValue = 0;
 
-  const utxoResp = await fetch(`${wocBase}/address/${senderAddress}/unspent`);
-  if (!utxoResp.ok) throw new Error(`Failed to fetch UTXOs: ${utxoResp.status}`);
-  const allUtxos = await utxoResp.json();
-
-  // Filter for usable UTXOs (need enough for payment + fee)
-  const minRequired = sats + 200; // payment + estimated fee
-  const utxos = allUtxos.filter(u => u.value >= minRequired);
-  if (utxos.length === 0) {
-    const totalAvailable = allUtxos.reduce((sum, u) => sum + u.value, 0);
-    throw new Error(`Insufficient funds. Need ${minRequired} sats, have ${totalAvailable} sats available.`);
-  }
-
-  const utxo = utxos[0]; // Use first sufficient UTXO
-
-  // Fetch source transaction
-  const rawResp = await fetch(`${wocBase}/tx/${utxo.tx_hash}/hex`);
-  if (!rawResp.ok) throw new Error(`Failed to fetch source tx: ${rawResp.status}`);
-  const rawTxHex = await rawResp.text();
-  const sourceTx = Transaction.fromHex(rawTxHex);
-
-  // Fetch merkle proof for source tx
-  const txInfoResp = await fetch(`${wocBase}/tx/${utxo.tx_hash}`);
-  const txInfo = await txInfoResp.json();
-  const blockHeight = txInfo.blockheight;
-
-  if (blockHeight && txInfo.confirmations > 0) {
-    const proofResp = await fetch(`${wocBase}/tx/${utxo.tx_hash}/proof/tsc`);
-    if (proofResp.ok) {
-      const proofData = await proofResp.json();
-      if (Array.isArray(proofData) && proofData.length > 0) {
-        const proof = proofData[0];
-        const mpPath = buildMerklePathFromTSC(utxo.tx_hash, proof.index, proof.nodes, blockHeight);
-        sourceTx.merklePath = mpPath;
+  // Try stored BEEF first
+  try {
+    if (fs.existsSync(beefStorePath)) {
+      const stored = JSON.parse(fs.readFileSync(beefStorePath, 'utf-8'));
+      if (stored.satoshis >= sats + 200) {
+        sourceTx = reconstructFromChain(stored);
+        sourceVout = stored.vout;
+        sourceValue = stored.satoshis;
       }
+    }
+  } catch {}
+
+  // Fallback to WoC if no stored BEEF
+  if (!sourceTx) {
+    const utxoResp = await wocFetch(`/address/${senderAddress}/unspent`);
+    if (!utxoResp.ok) throw new Error(`Failed to fetch UTXOs: ${utxoResp.status}`);
+    const allUtxos = await utxoResp.json();
+    const utxos = allUtxos.filter(u => u.value >= sats + 200);
+    if (utxos.length === 0) throw new Error(`Insufficient funds. Need ${sats + 200} sats.`);
+    const utxo = utxos[0];
+
+    const rawResp = await wocFetch(`/tx/${utxo.tx_hash}/hex`);
+    if (!rawResp.ok) throw new Error(`Failed to fetch source tx: ${rawResp.status}`);
+    sourceTx = Transaction.fromHex(await rawResp.text());
+    sourceVout = utxo.tx_pos;
+    sourceValue = utxo.value;
+
+    // Walk back for merkle proof
+    let curTx = sourceTx; let curTxid = utxo.tx_hash;
+    for (let depth = 0; depth < 10; depth++) {
+      const infoResp = await wocFetch(`/tx/${curTxid}`);
+      if (!infoResp.ok) break;
+      const info = await infoResp.json();
+      if (info.confirmations > 0 && info.blockheight) {
+        const proofResp = await wocFetch(`/tx/${curTxid}/proof/tsc`);
+        if (proofResp.ok) {
+          const pd = await proofResp.json();
+          if (Array.isArray(pd) && pd.length > 0) {
+            curTx.merklePath = buildMerklePathFromTSC(curTxid, pd[0].index, pd[0].nodes, info.blockheight);
+          }
+        }
+        break;
+      }
+      const parentTxid = curTx.inputs[0]?.sourceTXID;
+      if (!parentTxid) break;
+      const parentResp = await wocFetch(`/tx/${parentTxid}/hex`);
+      if (!parentResp.ok) break;
+      const parentTx = Transaction.fromHex(await parentResp.text());
+      curTx.inputs[0].sourceTransaction = parentTx;
+      curTx = parentTx; curTxid = parentTxid;
     }
   }
 
@@ -880,7 +1292,7 @@ async function buildDirectPayment(recipientPubKey, sats, desc) {
   const tx = new Transaction();
   tx.addInput({
     sourceTransaction: sourceTx,
-    sourceOutputIndex: utxo.tx_pos,
+    sourceOutputIndex: sourceVout,
     unlockingScriptTemplate: new P2PKH().unlock(privKey),
     sequence: 0xffffffff,
   });
@@ -894,10 +1306,10 @@ async function buildDirectPayment(recipientPubKey, sats, desc) {
   // Calculate fee and change
   const estimatedSize = 148 + 34 * 2 + 10; // 1 input, 2 outputs
   const fee = Math.max(Math.ceil(estimatedSize * 0.5), 50); // 0.5 sat/byte min
-  const change = utxo.value - sats - fee;
+  const change = sourceValue - sats - fee;
 
   if (change < 0) {
-    throw new Error(`Insufficient funds after fee. UTXO: ${utxo.value}, payment: ${sats}, fee: ${fee}`);
+    throw new Error(`Insufficient funds after fee. Source: ${sourceValue}, payment: ${sats}, fee: ${fee}`);
   }
 
   // Output 1: Change back to sender (if dust threshold met)
@@ -910,25 +1322,31 @@ async function buildDirectPayment(recipientPubKey, sats, desc) {
 
   await tx.sign();
 
-  // Build BEEF
+  // Build BEEF — auto-follows source chain
   const beef = new Beef();
-  beef.mergeTransaction(sourceTx);
   beef.mergeTransaction(tx);
 
   const txid = tx.id('hex');
   const atomicBeefBytes = beef.toBinaryAtomic(txid);
   const beefBase64 = Utils.toBase64(Array.from(atomicBeefBytes));
 
-  // Broadcast the transaction
-  const broadcastResp = await fetch(`${wocBase}/tx/raw`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ txhex: tx.toHex() }),
-  });
+  // Save change BEEF for next tx (instant chaining)
+  if (change >= 136) {
+    saveChangeBeef(tx, change, 1);
+  }
 
-  if (!broadcastResp.ok) {
-    const errText = await broadcastResp.text();
-    throw new Error(`Broadcast failed: ${broadcastResp.status} — ${errText}`);
+  // Broadcast (best-effort, not required for BEEF-based delivery)
+  try {
+    const broadcastResp = await wocFetch(`/tx/raw`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ txhex: tx.toHex() }),
+    });
+    if (!broadcastResp.ok) {
+      console.error(`[broadcast] Non-fatal: ${broadcastResp.status}`);
+    }
+  } catch (bcastErr) {
+    console.error(`[broadcast] Non-fatal: ${bcastErr.message}`);
   }
 
   const explorerBase = NETWORK === 'mainnet' ? 'https://whatsonchain.com' : 'https://test.whatsonchain.com';
@@ -1248,6 +1666,13 @@ function loadIdentity() {
   if (!fs.existsSync(identityPath)) {
     throw new Error('Wallet not initialized. Run: overlay-cli setup');
   }
+  // Issue #8: Warn if wallet identity file has overly permissive mode
+  try {
+    const fileMode = fs.statSync(identityPath).mode & 0o777;
+    if (fileMode & 0o044) { // world or group readable
+      console.error(`[security] WARNING: ${identityPath} has permissive mode 0${fileMode.toString(8)}. Run: chmod 600 ${identityPath}`);
+    }
+  } catch {}
   const identity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
   const privKey = PrivateKey.fromHex(identity.rootKeyHex);
   return { identityKey: identity.identityKey, privKey };
@@ -1276,6 +1701,141 @@ function verifyRelaySignature(fromKey, to, type, payload, signatureHex) {
     return { valid: pubKey.verify(msgHash, sig) };
   } catch (err) {
     return { valid: false, reason: String(err) };
+  }
+}
+
+/**
+ * Format a service response into a human-readable summary based on service type.
+ * Returns an object with { type, summary, details } for notification formatting.
+ */
+function formatServiceResponse(serviceId, status, result) {
+  const base = { serviceId, status };
+  
+  if (status === 'rejected') {
+    return {
+      ...base,
+      type: 'rejection',
+      summary: `Service rejected: ${result?.reason || 'unknown reason'}`,
+      details: result,
+    };
+  }
+  
+  switch (serviceId) {
+    case 'tell-joke':
+      return {
+        ...base,
+        type: 'joke',
+        summary: result?.setup && result?.punchline
+          ? `${result.setup} — ${result.punchline}`
+          : 'Joke received',
+        details: { setup: result?.setup, punchline: result?.punchline },
+      };
+    
+    case 'code-review':
+      // Code review results include summary, findings, severity breakdown
+      const findings = result?.findings || [];
+      const severityCounts = findings.reduce((acc, f) => {
+        acc[f.severity] = (acc[f.severity] || 0) + 1;
+        return acc;
+      }, {});
+      const severityStr = Object.entries(severityCounts)
+        .map(([k, v]) => `${v} ${k}`)
+        .join(', ') || 'none';
+      
+      return {
+        ...base,
+        type: 'code-review',
+        summary: result?.summary || 'Code review completed',
+        details: {
+          findingsCount: findings.length,
+          severityBreakdown: severityCounts,
+          assessment: result?.assessment || result?.overallAssessment,
+          findings: findings.slice(0, 5), // First 5 findings for preview
+        },
+        displaySummary: `Code Review: ${findings.length} findings (${severityStr}). ${result?.assessment || ''}`,
+      };
+    
+    case 'summarize':
+      return {
+        ...base,
+        type: 'summarize',
+        summary: result?.summary || 'Summary generated',
+        details: {
+          summary: result?.summary,
+          keyPoints: result?.keyPoints,
+          wordCount: result?.wordCount,
+        },
+      };
+    
+    case 'translate':
+      return {
+        ...base,
+        type: 'translate',
+        summary: result?.error
+          ? `Translation failed: ${result.error}`
+          : `Translated (${result?.from || '?'} → ${result?.to || '?'}): "${result?.translatedText?.slice(0, 100)}${result?.translatedText?.length > 100 ? '...' : ''}"`,
+        details: {
+          originalText: result?.originalText,
+          translatedText: result?.translatedText,
+          from: result?.from,
+          to: result?.to,
+          provider: result?.provider,
+          error: result?.error,
+        },
+      };
+    
+    case 'api-proxy':
+      const apiName = result?.api || 'unknown';
+      let apiSummary = result?.error ? `API proxy (${apiName}) failed: ${result.error}` : `API proxy (${apiName}) completed`;
+      // Add specific summary based on API type
+      if (!result?.error) {
+        if (apiName === 'weather' && result?.temperature) {
+          apiSummary = `Weather: ${result.location} — ${result.temperature.celsius}°C, ${result.condition}`;
+        } else if (apiName === 'exchange-rate' && result?.rate) {
+          apiSummary = `Exchange: ${result.amount} ${result.from} = ${result.converted} ${result.to}`;
+        } else if (apiName === 'crypto-price' && result?.price) {
+          apiSummary = `${result.coin}: ${result.price} ${result.currency} (${result.change24h > 0 ? '+' : ''}${result.change24h?.toFixed(2)}%)`;
+        } else if (apiName === 'geocode' && result?.displayName) {
+          apiSummary = `Geocode: ${result.displayName?.slice(0, 80)}`;
+        } else if (apiName === 'ip-lookup' && result?.ip) {
+          apiSummary = `IP: ${result.ip} — ${result.city}, ${result.country}`;
+        }
+      }
+      return {
+        ...base,
+        type: 'api-proxy',
+        summary: apiSummary,
+        details: result,
+      };
+    
+    case 'roulette':
+      return {
+        ...base,
+        type: 'roulette',
+        summary: result?.message || (result?.won ? `Won ${result.payout} sats!` : `Lost ${result.betAmount} sats`),
+        details: {
+          spin: result?.spin,
+          color: result?.color,
+          bet: result?.bet,
+          betAmount: result?.betAmount,
+          won: result?.won,
+          payout: result?.payout,
+          multiplier: result?.multiplier,
+        },
+      };
+    
+    default:
+      // Generic service response — show preview of result
+      const resultPreview = result
+        ? JSON.stringify(result).slice(0, 200) + (JSON.stringify(result).length > 200 ? '...' : '')
+        : 'No result data';
+      return {
+        ...base,
+        type: 'generic',
+        summary: `Service '${serviceId}' completed`,
+        details: result,
+        resultPreview,
+      };
   }
 }
 
@@ -1399,6 +1959,18 @@ async function processMessage(msg, identityKey, privKey) {
     ? verifyRelaySignature(msg.from, msg.to, msg.type, msg.payload, msg.signature)
     : { valid: null };
 
+  // Issue #7: Enforce signature verification — reject unsigned/forged messages
+  // Pings are harmless; service-requests and other types must have valid signatures
+  if (msg.type === 'service-request' && sigCheck.valid !== true) {
+    console.error(JSON.stringify({ event: 'signature-rejected', type: msg.type, from: msg.from, reason: sigCheck.reason || 'missing signature' }));
+    return {
+      id: msg.id, type: msg.type, from: msg.from,
+      action: 'rejected', reason: 'invalid-signature',
+      signatureValid: sigCheck.valid,
+      ack: true,
+    };
+  }
+
   if (msg.type === 'ping') {
     // Auto-respond with pong
     const pongPayload = {
@@ -1424,6 +1996,16 @@ async function processMessage(msg, identityKey, privKey) {
     const serviceId = msg.payload?.serviceId;
     if (serviceId === 'tell-joke') {
       return await processJokeRequest(msg, identityKey, privKey);
+    } else if (serviceId === 'code-review') {
+      return await processCodeReview(msg, identityKey, privKey);
+    } else if (serviceId === 'web-research') {
+      return await processWebResearch(msg, identityKey, privKey);
+    } else if (serviceId === 'translate') {
+      return await processTranslate(msg, identityKey, privKey);
+    } else if (serviceId === 'api-proxy') {
+      return await processApiProxy(msg, identityKey, privKey);
+    } else if (serviceId === 'roulette') {
+      return await processRoulette(msg, identityKey, privKey);
     } else {
       // Unknown service — don't auto-process
       return {
@@ -1440,10 +2022,19 @@ async function processMessage(msg, identityKey, privKey) {
     };
 
   } else if (msg.type === 'service-response') {
+    const serviceId = msg.payload?.serviceId;
+    const status = msg.payload?.status;
+    const result = msg.payload?.result;
+    
+    // Format summary based on service type
+    const formatted = formatServiceResponse(serviceId, status, result);
+    
     return {
       id: msg.id, type: 'service-response', action: 'received', from: msg.from,
-      serviceId: msg.payload?.serviceId, status: msg.payload?.status,
-      result: msg.payload?.result, requestId: msg.payload?.requestId, ack: true,
+      serviceId, status, result, requestId: msg.payload?.requestId,
+      direction: 'incoming-response', // We requested, they responded
+      formatted, // Human-readable summary
+      ack: true,
     };
 
   } else {
@@ -1456,9 +2047,1298 @@ async function processMessage(msg, identityKey, privKey) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Code-review service
+// ---------------------------------------------------------------------------
+
+async function processCodeReview(msg, identityKey, privKey) {
+  const PRICE = 50;
+
+  // Helper to send rejection
+  async function reject(reason, shortReason) {
+    const rejectPayload = {
+      requestId: msg.id, serviceId: 'code-review', status: 'rejected', reason,
+    };
+    const rejectSig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetch(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: identityKey, to: msg.from, type: 'service-response',
+        payload: rejectPayload, signature: rejectSig,
+      }),
+    });
+    return {
+      id: msg.id, type: 'service-request', serviceId: 'code-review',
+      action: 'rejected', reason: shortReason, from: msg.from, ack: true,
+    };
+  }
+
+  // ── Payment verification via shared helper ──
+  const walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+  const ourHash160 = Hash.hash160(PrivateKey.fromHex(walletIdentity.rootKeyHex).toPublicKey().encode(true));
+  const payResult = await verifyAndAcceptPayment(msg.payload?.payment, PRICE, msg.from, 'code-review', ourHash160);
+  if (!payResult.accepted) {
+    return reject(`Payment rejected: ${payResult.error}. This service costs ${PRICE} sats.`, payResult.error);
+  }
+
+  const paymentTxid = payResult.txid;
+  const paymentSats = payResult.satoshis;
+  const walletAccepted = payResult.walletAccepted;
+  const acceptError = payResult.error;
+
+  // Perform the code review
+  const input = msg.payload?.input || msg.payload;
+  let reviewResult;
+  try {
+    reviewResult = await performCodeReview(input);
+  } catch (err) {
+    reviewResult = { type: 'code-review', error: `Review failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+
+  // Send response
+  const responsePayload = {
+    requestId: msg.id, serviceId: 'code-review', status: 'fulfilled',
+    result: reviewResult, paymentAccepted: true, paymentTxid,
+    satoshisReceived: paymentSats, walletAccepted,
+    ...(acceptError ? { walletError: acceptError } : {}),
+  };
+  const respSig = signRelayMessage(privKey, msg.from, 'service-response', responsePayload);
+  await fetch(`${OVERLAY_URL}/relay/send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      from: identityKey, to: msg.from, type: 'service-response',
+      payload: responsePayload, signature: respSig,
+    }),
+  });
+
+  return {
+    id: msg.id, type: 'service-request', serviceId: 'code-review',
+    action: 'fulfilled', review: reviewResult, paymentAccepted: true, paymentTxid,
+    satoshisReceived: paymentSats, walletAccepted,
+    ...(acceptError ? { walletError: acceptError } : {}),
+    from: msg.from, ack: true,
+  };
+}
+
+/** Perform code review on a PR URL or code snippet. */
+async function performCodeReview(input) {
+  if (input.prUrl) {
+    const match = input.prUrl.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+    if (!match) return { type: 'code-review', error: 'Invalid PR URL format. Expected: https://github.com/owner/repo/pull/123' };
+    const [, owner, repo, prNumber] = match;
+
+    // Strict validation of owner/repo to prevent shell injection (Issue #4)
+    const safeNameRegex = /^[a-zA-Z0-9._-]+$/;
+    if (!safeNameRegex.test(owner) || !safeNameRegex.test(repo)) {
+      return { type: 'code-review', error: 'Invalid owner/repo name — only alphanumeric, dots, hyphens, and underscores allowed' };
+    }
+    if (!/^\d+$/.test(prNumber)) {
+      return { type: 'code-review', error: 'Invalid PR number — must be numeric' };
+    }
+
+    const { execFileSync } = await import('child_process');
+    let prInfo, prDiff;
+    try {
+      prInfo = JSON.parse(execFileSync(
+        'gh', ['pr', 'view', prNumber, '--repo', `${owner}/${repo}`, '--json', 'title,body,additions,deletions,files,author'],
+        { encoding: 'utf-8', timeout: 30000 },
+      ));
+    } catch (e) {
+      return { type: 'code-review', error: `Failed to fetch PR metadata: ${e.message}` };
+    }
+    try {
+      prDiff = execFileSync(
+        'gh', ['pr', 'diff', prNumber, '--repo', `${owner}/${repo}`],
+        { encoding: 'utf-8', maxBuffer: 2 * 1024 * 1024, timeout: 30000 },
+      );
+    } catch (e) {
+      return { type: 'code-review', error: `Failed to fetch PR diff: ${e.message}` };
+    }
+
+    const review = analyzePrReview(prInfo, prDiff);
+
+    // Post the review as a comment on the GitHub PR
+    try {
+      // Group findings by severity
+      const bySeverity = { critical: [], high: [], warning: [], info: [] };
+      for (const f of review.findings) {
+        (bySeverity[f.severity] || bySeverity.info).push(f);
+      }
+
+      let findingsText = '';
+      if (review.findings.length === 0) {
+        findingsText = '_No issues found._';
+      } else {
+        const sections = [];
+        if (bySeverity.critical.length > 0) {
+          sections.push('#### 🔴 Critical');
+          sections.push(...bySeverity.critical.map(f => `- \`${f.file}${f.line ? ':' + f.line : ''}\` — ${f.detail}`));
+          sections.push('');
+        }
+        if (bySeverity.high.length > 0) {
+          sections.push('#### 🟠 High');
+          sections.push(...bySeverity.high.map(f => `- \`${f.file}${f.line ? ':' + f.line : ''}\` — ${f.detail}`));
+          sections.push('');
+        }
+        if (bySeverity.warning.length > 0) {
+          sections.push('#### 🟡 Warnings');
+          sections.push(...bySeverity.warning.map(f => `- \`${f.file}${f.line ? ':' + f.line : ''}\` — ${f.detail}`));
+          sections.push('');
+        }
+        if (bySeverity.info.length > 0) {
+          sections.push('#### ℹ️ Info');
+          sections.push(...bySeverity.info.map(f => `- \`${f.file}${f.line ? ':' + f.line : ''}\` — ${f.detail}`));
+          sections.push('');
+        }
+        findingsText = sections.join('\n');
+      }
+
+      const suggestionsText = review.suggestions.length > 0
+        ? '### Suggestions\n' + review.suggestions.map(s => `- ${s}`).join('\n')
+        : '';
+
+      const summaryLine = review.findingsSummary
+        ? `🔴 ${review.findingsSummary.critical} critical · 🟠 ${review.findingsSummary.high} high · 🟡 ${review.findingsSummary.warning} warnings · ℹ️ ${review.findingsSummary.info} info`
+        : '';
+
+      const commentBody = [
+        `## 🦉 Automated Code Review`,
+        ``,
+        `| | |`,
+        `|---|---|`,
+        `| **PR** | ${review.summary} |`,
+        `| **Author** | @${review.author} |`,
+        `| **Files** | ${review.filesReviewed} |`,
+        `| **Changes** | ${review.linesChanged} |`,
+        `| **Findings** | ${summaryLine} |`,
+        ``,
+        `### Findings`,
+        ``,
+        findingsText,
+        suggestionsText,
+        `### Overall Assessment`,
+        ``,
+        review.overallAssessment,
+        ``,
+        `---`,
+        `_Reviewed by [BSV Overlay Skill](https://github.com/galt-tr/bsv-overlay-skill) · Paid via BSV micropayment (50 sats)_`,
+      ].join('\n');
+
+      // Write comment to temp file to avoid shell escaping issues (Issue #4: --body-file)
+      const tmpFile = path.join(os.tmpdir(), `cr-${Date.now()}.md`);
+      fs.writeFileSync(tmpFile, commentBody, 'utf-8');
+      execFileSync(
+        'gh', ['pr', 'comment', prNumber, '--repo', `${owner}/${repo}`, '--body-file', tmpFile],
+        { encoding: 'utf-8', timeout: 15000 },
+      );
+      try { fs.unlinkSync(tmpFile); } catch {} // cleanup
+      review.githubCommentPosted = true;
+    } catch (e) {
+      review.githubCommentPosted = false;
+      review.githubCommentError = e instanceof Error ? e.message : String(e);
+    }
+
+    return review;
+  } else if (input.code) {
+    return analyzeCodeSnippet(input.code, input.language || 'unknown');
+  }
+
+  return { type: 'code-review', error: 'Provide either {prUrl} or {code, language} in the input.' };
+}
+
+// ---------------------------------------------------------------------------
+// Service: web-research (50 sats)
+// ---------------------------------------------------------------------------
+
+async function processWebResearch(msg, identityKey, privKey) {
+  const PRICE = 50;
+  const payment = msg.payload?.payment;
+  const input = msg.payload?.input || msg.payload;
+  const query = input?.query || input?.question || input?.q;
+
+  if (!query || typeof query !== 'string' || query.trim().length < 3) {
+    // Send rejection — no valid query
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'web-research',
+      status: 'rejected',
+      reason: 'Missing or invalid query. Send {input: {query: "your question"}}',
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetch(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    });
+    return { id: msg.id, type: 'service-request', serviceId: 'web-research', action: 'rejected', reason: 'no query', from: msg.from, ack: true };
+  }
+
+  // ── Payment verification via shared helper ──
+  const walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+  const ourHash160 = Hash.hash160(PrivateKey.fromHex(walletIdentity.rootKeyHex).toPublicKey().encode(true));
+  const payResult = await verifyAndAcceptPayment(payment, PRICE, msg.from, 'web-research', ourHash160);
+  if (!payResult.accepted) {
+    const rejectPayload = { requestId: msg.id, serviceId: 'web-research', status: 'rejected', reason: `Payment rejected: ${payResult.error}. Web research costs ${PRICE} sats.` };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetch(`${OVERLAY_URL}/relay/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }) });
+    return { id: msg.id, type: 'service-request', serviceId: 'web-research', action: 'rejected', reason: payResult.error, from: msg.from, ack: true };
+  }
+
+  const paymentTxid = payResult.txid;
+  const paymentSats = payResult.satoshis;
+  const walletAccepted = payResult.walletAccepted;
+  const acceptError = payResult.error;
+
+  // ── Queue the research for Clawdbot to handle (uses built-in web_search) ──
+  const queueEntry = {
+    type: 'pending-research',
+    requestId: msg.id,
+    query: query.trim(),
+    from: msg.from,
+    identityKey,
+    paymentTxid,
+    satoshisReceived: paymentSats,
+    walletAccepted,
+    ...(acceptError ? { walletError: acceptError } : {}),
+    _ts: Date.now(),
+  };
+  const queuePath = path.join(OVERLAY_STATE_DIR, 'research-queue.jsonl');
+  try {
+    fs.mkdirSync(OVERLAY_STATE_DIR, { recursive: true });
+    fs.appendFileSync(queuePath, JSON.stringify(queueEntry) + '\n');
+  } catch {}
+
+  return {
+    id: msg.id,
+    type: 'service-request',
+    serviceId: 'web-research',
+    action: 'queued',
+    query: query.slice(0, 80),
+    paymentAccepted: true,
+    paymentTxid,
+    satoshisReceived: paymentSats,
+    walletAccepted,
+    ...(acceptError ? { walletError: acceptError } : {}),
+    from: msg.from,
+    ack: true,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Service: translate (20 sats)
+// ---------------------------------------------------------------------------
+
+async function processTranslate(msg, identityKey, privKey) {
+  const PRICE = 20;
+  const payment = msg.payload?.payment;
+  const input = msg.payload?.input || msg.payload;
+  const text = input?.text;
+  const targetLang = input?.to || input?.targetLang || input?.target || 'en';
+  const sourceLang = input?.from || input?.sourceLang || input?.source || 'auto';
+
+  // Helper to send rejection
+  async function reject(reason, shortReason) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'translate',
+      status: 'rejected',
+      reason,
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    }, 15000);
+    return { id: msg.id, type: 'service-request', serviceId: 'translate', action: 'rejected', reason: shortReason, from: msg.from, ack: true };
+  }
+
+  // Validate input
+  if (!text || typeof text !== 'string' || text.trim().length < 1) {
+    return reject('Missing or invalid text. Send {input: {text: "your text", to: "es"}}', 'no text');
+  }
+  if (text.length > 5000) {
+    return reject('Text too long. Maximum 5000 characters.', 'text too long');
+  }
+
+  // ── Payment verification via shared helper ──
+  const walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+  const ourHash160 = Hash.hash160(PrivateKey.fromHex(walletIdentity.rootKeyHex).toPublicKey().encode(true));
+  const payResult = await verifyAndAcceptPayment(payment, PRICE, msg.from, 'translate', ourHash160);
+  if (!payResult.accepted) {
+    return reject(`Payment rejected: ${payResult.error}. Translation costs ${PRICE} sats.`, payResult.error);
+  }
+
+  const paymentTxid = payResult.txid;
+  const paymentSats = payResult.satoshis;
+  const walletAccepted = payResult.walletAccepted;
+  const acceptError = payResult.error;
+
+  // ── Perform the translation using LibreTranslate or MyMemory API ──
+  let translationResult;
+  try {
+    translationResult = await performTranslation(text.trim(), sourceLang, targetLang);
+  } catch (err) {
+    translationResult = { error: `Translation failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+
+  // Send response
+  const responsePayload = {
+    requestId: msg.id,
+    serviceId: 'translate',
+    status: translationResult.error ? 'partial' : 'fulfilled',
+    result: translationResult,
+    paymentAccepted: true,
+    paymentTxid,
+    satoshisReceived: paymentSats,
+    walletAccepted,
+    ...(acceptError ? { walletError: acceptError } : {}),
+  };
+  const respSig = signRelayMessage(privKey, msg.from, 'service-response', responsePayload);
+  await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      from: identityKey, to: msg.from, type: 'service-response',
+      payload: responsePayload, signature: respSig,
+    }),
+  }, 15000);
+
+  return {
+    id: msg.id,
+    type: 'service-request',
+    serviceId: 'translate',
+    action: translationResult.error ? 'partial' : 'fulfilled',
+    translation: translationResult,
+    paymentAccepted: true,
+    paymentTxid,
+    satoshisReceived: paymentSats,
+    walletAccepted,
+    direction: 'incoming-request',
+    formatted: {
+      type: 'translation',
+      summary: translationResult.error
+        ? `Translation failed: ${translationResult.error}`
+        : `Translated ${sourceLang} → ${targetLang}: "${translationResult.translatedText?.slice(0, 50)}${translationResult.translatedText?.length > 50 ? '...' : ''}"`,
+      earnings: paymentSats,
+    },
+    ...(acceptError ? { walletError: acceptError } : {}),
+    from: msg.from,
+    ack: true,
+  };
+}
+
+/**
+ * Perform translation using MyMemory API (free, no API key required).
+ * Falls back to a simple response if API fails.
+ */
+async function performTranslation(text, sourceLang, targetLang) {
+  // Normalize language codes
+  const langMap = {
+    'auto': 'autodetect',
+    'en': 'en', 'english': 'en',
+    'es': 'es', 'spanish': 'es',
+    'fr': 'fr', 'french': 'fr',
+    'de': 'de', 'german': 'de',
+    'it': 'it', 'italian': 'it',
+    'pt': 'pt', 'portuguese': 'pt',
+    'ru': 'ru', 'russian': 'ru',
+    'zh': 'zh', 'chinese': 'zh',
+    'ja': 'ja', 'japanese': 'ja',
+    'ko': 'ko', 'korean': 'ko',
+    'ar': 'ar', 'arabic': 'ar',
+    'hi': 'hi', 'hindi': 'hi',
+    'nl': 'nl', 'dutch': 'nl',
+    'pl': 'pl', 'polish': 'pl',
+    'sv': 'sv', 'swedish': 'sv',
+    'tr': 'tr', 'turkish': 'tr',
+    'vi': 'vi', 'vietnamese': 'vi',
+    'th': 'th', 'thai': 'th',
+    'id': 'id', 'indonesian': 'id',
+    'cs': 'cs', 'czech': 'cs',
+    'uk': 'uk', 'ukrainian': 'uk',
+    'el': 'el', 'greek': 'el',
+    'he': 'he', 'hebrew': 'he',
+    'da': 'da', 'danish': 'da',
+    'fi': 'fi', 'finnish': 'fi',
+    'no': 'no', 'norwegian': 'no',
+    'ro': 'ro', 'romanian': 'ro',
+    'hu': 'hu', 'hungarian': 'hu',
+    'bg': 'bg', 'bulgarian': 'bg',
+    'hr': 'hr', 'croatian': 'hr',
+    'sk': 'sk', 'slovak': 'sk',
+    'sl': 'sl', 'slovenian': 'sl',
+    'et': 'et', 'estonian': 'et',
+    'lv': 'lv', 'latvian': 'lv',
+    'lt': 'lt', 'lithuanian': 'lt',
+  };
+
+  const from = langMap[sourceLang.toLowerCase()] || sourceLang.toLowerCase().slice(0, 2);
+  const to = langMap[targetLang.toLowerCase()] || targetLang.toLowerCase().slice(0, 2);
+
+  // Use MyMemory Translation API (free, no key required, 1000 chars/day limit per IP for anonymous)
+  const langPair = from === 'autodetect' ? `|${to}` : `${from}|${to}`;
+  const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${encodeURIComponent(langPair)}`;
+
+  try {
+    const resp = await fetchWithTimeout(url, {}, 15000);
+    if (!resp.ok) {
+      throw new Error(`MyMemory API returned ${resp.status}`);
+    }
+    const data = await resp.json();
+
+    if (data.responseStatus === 200 && data.responseData?.translatedText) {
+      const detectedLang = data.responseData?.detectedLanguage || from;
+      return {
+        originalText: text,
+        translatedText: data.responseData.translatedText,
+        from: typeof detectedLang === 'string' ? detectedLang : from,
+        to: to,
+        confidence: data.responseData?.match || null,
+        provider: 'MyMemory',
+      };
+    } else {
+      throw new Error(data.responseDetails || 'Translation failed');
+    }
+  } catch (err) {
+    // Fallback: try LibreTranslate public instance
+    try {
+      const libreUrl = 'https://libretranslate.com/translate';
+      const libreResp = await fetchWithTimeout(libreUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          q: text,
+          source: from === 'autodetect' ? 'auto' : from,
+          target: to,
+          format: 'text',
+        }),
+      }, 15000);
+
+      if (libreResp.ok) {
+        const libreData = await libreResp.json();
+        if (libreData.translatedText) {
+          return {
+            originalText: text,
+            translatedText: libreData.translatedText,
+            from: libreData.detectedLanguage?.language || from,
+            to: to,
+            provider: 'LibreTranslate',
+          };
+        }
+      }
+    } catch { /* fallback failed */ }
+
+    // Return error
+    return {
+      error: err instanceof Error ? err.message : String(err),
+      originalText: text,
+      from: from,
+      to: to,
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Service: api-proxy (15 sats)
+// ---------------------------------------------------------------------------
+
+async function processApiProxy(msg, identityKey, privKey) {
+  const PRICE = 15;
+  const payment = msg.payload?.payment;
+  const input = msg.payload?.input || msg.payload;
+  const api = input?.api?.toLowerCase();
+  const params = input?.params || input;
+
+  // Helper to send rejection
+  async function reject(reason, shortReason) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'api-proxy',
+      status: 'rejected',
+      reason,
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    }, 15000);
+    return { id: msg.id, type: 'service-request', serviceId: 'api-proxy', action: 'rejected', reason: shortReason, from: msg.from, ack: true };
+  }
+
+  // Supported APIs
+  const SUPPORTED_APIS = ['weather', 'geocode', 'exchange-rate', 'ip-lookup', 'crypto-price'];
+
+  // Validate input
+  if (!api || typeof api !== 'string') {
+    return reject(`Missing API name. Supported: ${SUPPORTED_APIS.join(', ')}. Send {input: {api: "weather", params: {location: "NYC"}}}`, 'no api');
+  }
+  if (!SUPPORTED_APIS.includes(api)) {
+    return reject(`Unsupported API: ${api}. Supported: ${SUPPORTED_APIS.join(', ')}`, `unsupported api: ${api}`);
+  }
+
+  // ── Payment verification via shared helper ──
+  const walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+  const ourHash160 = Hash.hash160(PrivateKey.fromHex(walletIdentity.rootKeyHex).toPublicKey().encode(true));
+  const payResult = await verifyAndAcceptPayment(payment, PRICE, msg.from, 'api-proxy', ourHash160);
+  if (!payResult.accepted) {
+    return reject(`Payment rejected: ${payResult.error}. API proxy costs ${PRICE} sats.`, payResult.error);
+  }
+
+  const paymentTxid = payResult.txid;
+  const paymentSats = payResult.satoshis;
+  const walletAccepted = payResult.walletAccepted;
+  const acceptError = payResult.error;
+
+  // ── Execute the API proxy request ──
+  let apiResult;
+  try {
+    apiResult = await executeApiProxy(api, params);
+  } catch (err) {
+    apiResult = { error: `API call failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+
+  // Send response
+  const responsePayload = {
+    requestId: msg.id,
+    serviceId: 'api-proxy',
+    status: apiResult.error ? 'partial' : 'fulfilled',
+    result: apiResult,
+    paymentAccepted: true,
+    paymentTxid,
+    satoshisReceived: paymentSats,
+    walletAccepted,
+    ...(acceptError ? { walletError: acceptError } : {}),
+  };
+  const respSig = signRelayMessage(privKey, msg.from, 'service-response', responsePayload);
+  await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      from: identityKey, to: msg.from, type: 'service-response',
+      payload: responsePayload, signature: respSig,
+    }),
+  }, 15000);
+
+  return {
+    id: msg.id,
+    type: 'service-request',
+    serviceId: 'api-proxy',
+    action: apiResult.error ? 'partial' : 'fulfilled',
+    api,
+    result: apiResult,
+    paymentAccepted: true,
+    paymentTxid,
+    satoshisReceived: paymentSats,
+    walletAccepted,
+    direction: 'incoming-request',
+    formatted: {
+      type: 'api-proxy',
+      summary: apiResult.error
+        ? `API proxy (${api}) failed: ${apiResult.error}`
+        : `API proxy (${api}) completed successfully`,
+      earnings: paymentSats,
+    },
+    ...(acceptError ? { walletError: acceptError } : {}),
+    from: msg.from,
+    ack: true,
+  };
+}
+
+/**
+ * Execute an API proxy request.
+ * Supports: weather, geocode, exchange-rate, ip-lookup, crypto-price
+ */
+async function executeApiProxy(api, params) {
+  switch (api) {
+    case 'weather':
+      return await proxyWeather(params);
+    case 'geocode':
+      return await proxyGeocode(params);
+    case 'exchange-rate':
+      return await proxyExchangeRate(params);
+    case 'ip-lookup':
+      return await proxyIpLookup(params);
+    case 'crypto-price':
+      return await proxyCryptoPrice(params);
+    default:
+      return { error: `Unknown API: ${api}` };
+  }
+}
+
+/**
+ * Weather API proxy using wttr.in (free, no key required)
+ * Input: { location: "NYC" } or { location: "London" } or { lat, lon }
+ */
+async function proxyWeather(params) {
+  const location = params?.location || params?.city || params?.q;
+  if (!location) {
+    return { error: 'Missing location. Provide {location: "city name"} or {lat, lon}' };
+  }
+
+  const url = `https://wttr.in/${encodeURIComponent(location)}?format=j1`;
+  const resp = await fetchWithTimeout(url, {
+    headers: { 'User-Agent': 'BSV-Overlay-Proxy/1.0' }
+  }, 10000);
+
+  if (!resp.ok) {
+    return { error: `Weather API returned ${resp.status}` };
+  }
+
+  const data = await resp.json();
+  const current = data.current_condition?.[0];
+  const area = data.nearest_area?.[0];
+
+  return {
+    api: 'weather',
+    location: area?.areaName?.[0]?.value || location,
+    country: area?.country?.[0]?.value,
+    temperature: {
+      celsius: parseInt(current?.temp_C) || null,
+      fahrenheit: parseInt(current?.temp_F) || null,
+    },
+    feelsLike: {
+      celsius: parseInt(current?.FeelsLikeC) || null,
+      fahrenheit: parseInt(current?.FeelsLikeF) || null,
+    },
+    condition: current?.weatherDesc?.[0]?.value,
+    humidity: `${current?.humidity}%`,
+    windSpeed: {
+      kmh: parseInt(current?.windspeedKmph) || null,
+      mph: parseInt(current?.windspeedMiles) || null,
+    },
+    windDirection: current?.winddir16Point,
+    visibility: `${current?.visibility} km`,
+    uvIndex: current?.uvIndex,
+    observationTime: current?.observation_time,
+    provider: 'wttr.in',
+  };
+}
+
+/**
+ * Geocode API proxy using Nominatim/OpenStreetMap (free, no key required)
+ * Input: { address: "1600 Pennsylvania Ave, Washington DC" } for forward geocoding
+ *        { lat: 38.8977, lon: -77.0365 } for reverse geocoding
+ */
+async function proxyGeocode(params) {
+  const address = params?.address || params?.q || params?.query;
+  const lat = params?.lat || params?.latitude;
+  const lon = params?.lon || params?.lng || params?.longitude;
+
+  let url;
+  let mode;
+  if (address) {
+    url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=json&limit=1&addressdetails=1`;
+    mode = 'forward';
+  } else if (lat && lon) {
+    url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json&addressdetails=1`;
+    mode = 'reverse';
+  } else {
+    return { error: 'Provide {address: "..."} for forward geocoding or {lat, lon} for reverse geocoding' };
+  }
+
+  const resp = await fetchWithTimeout(url, {
+    headers: { 'User-Agent': 'BSV-Overlay-Proxy/1.0' }
+  }, 10000);
+
+  if (!resp.ok) {
+    return { error: `Geocode API returned ${resp.status}` };
+  }
+
+  const data = await resp.json();
+  const result = Array.isArray(data) ? data[0] : data;
+
+  if (!result || (Array.isArray(data) && data.length === 0)) {
+    return { error: 'No results found', query: address || `${lat},${lon}` };
+  }
+
+  return {
+    api: 'geocode',
+    mode,
+    query: address || `${lat},${lon}`,
+    lat: parseFloat(result.lat),
+    lon: parseFloat(result.lon),
+    displayName: result.display_name,
+    address: result.address ? {
+      houseNumber: result.address.house_number,
+      road: result.address.road,
+      city: result.address.city || result.address.town || result.address.village,
+      state: result.address.state,
+      postcode: result.address.postcode,
+      country: result.address.country,
+      countryCode: result.address.country_code?.toUpperCase(),
+    } : null,
+    boundingBox: result.boundingbox,
+    placeId: result.place_id,
+    osmType: result.osm_type,
+    provider: 'Nominatim/OpenStreetMap',
+  };
+}
+
+/**
+ * Exchange rate API proxy using exchangerate-api.com (free tier)
+ * Input: { from: "USD", to: "EUR" } or { from: "USD", to: "EUR", amount: 100 }
+ */
+async function proxyExchangeRate(params) {
+  const from = (params?.from || params?.base || 'USD').toUpperCase();
+  const to = (params?.to || params?.target || 'EUR').toUpperCase();
+  const amount = parseFloat(params?.amount) || 1;
+
+  // Use open.er-api.com (free, no key required)
+  const url = `https://open.er-api.com/v6/latest/${from}`;
+  const resp = await fetchWithTimeout(url, {}, 10000);
+
+  if (!resp.ok) {
+    return { error: `Exchange rate API returned ${resp.status}` };
+  }
+
+  const data = await resp.json();
+  if (data.result !== 'success') {
+    return { error: data.error || 'Exchange rate lookup failed' };
+  }
+
+  const rate = data.rates?.[to];
+  if (!rate) {
+    return { error: `Currency not found: ${to}`, availableCurrencies: Object.keys(data.rates || {}).slice(0, 20) };
+  }
+
+  return {
+    api: 'exchange-rate',
+    from,
+    to,
+    rate,
+    amount,
+    converted: Math.round(amount * rate * 100) / 100,
+    lastUpdate: data.time_last_update_utc,
+    provider: 'open.er-api.com',
+  };
+}
+
+/**
+ * IP lookup API proxy using ip-api.com (free, no key required)
+ * Input: { ip: "8.8.8.8" } or {} for own IP
+ */
+async function proxyIpLookup(params) {
+  const ip = params?.ip || params?.address || '';
+  const url = ip ? `http://ip-api.com/json/${ip}` : 'http://ip-api.com/json/';
+
+  const resp = await fetchWithTimeout(url, {}, 10000);
+
+  if (!resp.ok) {
+    return { error: `IP lookup API returned ${resp.status}` };
+  }
+
+  const data = await resp.json();
+  if (data.status === 'fail') {
+    return { error: data.message || 'IP lookup failed', query: ip };
+  }
+
+  return {
+    api: 'ip-lookup',
+    ip: data.query,
+    country: data.country,
+    countryCode: data.countryCode,
+    region: data.regionName,
+    regionCode: data.region,
+    city: data.city,
+    zip: data.zip,
+    lat: data.lat,
+    lon: data.lon,
+    timezone: data.timezone,
+    isp: data.isp,
+    org: data.org,
+    as: data.as,
+    provider: 'ip-api.com',
+  };
+}
+
+/**
+ * Crypto price API proxy using CoinGecko (free, no key required)
+ * Input: { coin: "bitcoin" } or { coin: "ethereum", currency: "eur" }
+ */
+async function proxyCryptoPrice(params) {
+  const coin = (params?.coin || params?.crypto || params?.id || 'bitcoin').toLowerCase();
+  const currency = (params?.currency || params?.vs || 'usd').toLowerCase();
+
+  // Map common symbols to CoinGecko IDs
+  const coinMap = {
+    'btc': 'bitcoin', 'eth': 'ethereum', 'bsv': 'bitcoin-sv',
+    'ltc': 'litecoin', 'xrp': 'ripple', 'doge': 'dogecoin',
+    'ada': 'cardano', 'sol': 'solana', 'dot': 'polkadot',
+    'matic': 'matic-network', 'link': 'chainlink', 'avax': 'avalanche-2',
+  };
+  const coinId = coinMap[coin] || coin;
+
+  const url = `https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=${currency}&include_24hr_change=true&include_market_cap=true&include_24hr_vol=true`;
+  const resp = await fetchWithTimeout(url, {}, 10000);
+
+  if (!resp.ok) {
+    return { error: `Crypto price API returned ${resp.status}` };
+  }
+
+  const data = await resp.json();
+  const coinData = data[coinId];
+
+  if (!coinData) {
+    return { error: `Coin not found: ${coin}`, suggestion: 'Use CoinGecko ID (e.g., "bitcoin", "ethereum", "bitcoin-sv")' };
+  }
+
+  return {
+    api: 'crypto-price',
+    coin: coinId,
+    currency: currency.toUpperCase(),
+    price: coinData[currency],
+    change24h: coinData[`${currency}_24h_change`],
+    marketCap: coinData[`${currency}_market_cap`],
+    volume24h: coinData[`${currency}_24h_vol`],
+    provider: 'CoinGecko',
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Service: roulette (variable sats - gambling)
+// ---------------------------------------------------------------------------
+
+// Roulette wheel configuration (European single-zero)
+const ROULETTE_NUMBERS = [
+  0, 32, 15, 19, 4, 21, 2, 25, 17, 34, 6, 27, 13, 36, 11, 30, 8, 23, 10,
+  5, 24, 16, 33, 1, 20, 14, 31, 9, 22, 18, 29, 7, 28, 12, 35, 3, 26
+];
+const RED_NUMBERS = [1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36];
+const BLACK_NUMBERS = [2, 4, 6, 8, 10, 11, 13, 15, 17, 20, 22, 24, 26, 28, 29, 31, 33, 35];
+
+const ROULETTE_MIN_BET = 10;
+const ROULETTE_MAX_BET = 1000;
+
+async function processRoulette(msg, identityKey, privKey) {
+  const payment = msg.payload?.payment;
+  const input = msg.payload?.input || msg.payload;
+  const bet = input?.bet;
+  const betAmount = payment?.satoshis || 0;
+
+  // Helper to send rejection
+  async function reject(reason, shortReason) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'roulette',
+      status: 'rejected',
+      reason,
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    }, 15000);
+    return { id: msg.id, type: 'service-request', serviceId: 'roulette', action: 'rejected', reason: shortReason, from: msg.from, ack: true };
+  }
+
+  // Validate bet type
+  const validBets = ['red', 'black', 'odd', 'even', 'low', 'high', '1st12', '2nd12', '3rd12'];
+  const isNumberBet = typeof bet === 'number' && bet >= 0 && bet <= 36;
+  const isNamedBet = typeof bet === 'string' && validBets.includes(bet.toLowerCase());
+  
+  if (!isNumberBet && !isNamedBet) {
+    return reject(
+      `Invalid bet. Options: single number (0-36), or: ${validBets.join(', ')}. Example: {bet: "red"} or {bet: 17}`,
+      'invalid bet'
+    );
+  }
+
+  // ── Payment verification via shared helper ──
+  if (betAmount > ROULETTE_MAX_BET) {
+    return reject(`Maximum bet is ${ROULETTE_MAX_BET} sats. You sent ${betAmount}.`, `bet too high: ${betAmount}`);
+  }
+
+  const walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+  const ourHash160 = Hash.hash160(PrivateKey.fromHex(walletIdentity.rootKeyHex).toPublicKey().encode(true));
+  const payResult = await verifyAndAcceptPayment(payment, ROULETTE_MIN_BET, msg.from, 'roulette', ourHash160);
+  if (!payResult.accepted) {
+    return reject(`Payment rejected: ${payResult.error}. Place your bet (${ROULETTE_MIN_BET}-${ROULETTE_MAX_BET} sats).`, payResult.error);
+  }
+
+  const paymentTxid = payResult.txid;
+  const paymentSats = payResult.satoshis;
+  const walletAccepted = payResult.walletAccepted;
+  const acceptError = payResult.error;
+  const actualBetAmount = Math.min(paymentSats, ROULETTE_MAX_BET);
+
+  // ── SPIN THE WHEEL ──
+  const spinResult = spinRouletteWheel();
+  const normalizedBet = isNumberBet ? bet : bet.toLowerCase();
+  const { won, payout, multiplier } = evaluateRouletteBet(normalizedBet, spinResult, actualBetAmount);
+
+  // Determine color of result
+  const resultColor = spinResult === 0 ? 'green' : (RED_NUMBERS.includes(spinResult) ? 'red' : 'black');
+
+  // ── If player won, pay them back ──
+  let winningsPaid = false;
+  let winningsPayment = null;
+  let payoutError = null;
+
+  if (won && payout > 0) {
+    try {
+      winningsPayment = await buildDirectPayment(msg.from, payout, `Roulette winnings: ${normalizedBet} on ${spinResult}`);
+      winningsPaid = true;
+    } catch (payErr) {
+      payoutError = `Failed to send winnings: ${payErr instanceof Error ? payErr.message : String(payErr)}`;
+    }
+  }
+
+  // Build result
+  const gameResult = {
+    spin: spinResult,
+    color: resultColor,
+    bet: normalizedBet,
+    betAmount: actualBetAmount,
+    won,
+    multiplier: won ? multiplier : 0,
+    payout: won ? payout : 0,
+    winningsPaid,
+    ...(winningsPayment ? { payoutTxid: winningsPayment.txid } : {}),
+    ...(payoutError ? { payoutError } : {}),
+    message: won
+      ? `🎰 ${spinResult} ${resultColor.toUpperCase()}! You WIN ${payout} sats (${multiplier}x)!`
+      : `🎰 ${spinResult} ${resultColor.toUpperCase()}. You lose ${actualBetAmount} sats. Better luck next time!`,
+  };
+
+  // Send response
+  const responsePayload = {
+    requestId: msg.id,
+    serviceId: 'roulette',
+    status: 'fulfilled',
+    result: gameResult,
+    paymentAccepted: true,
+    paymentTxid,
+    satoshisReceived: paymentSats,
+    walletAccepted,
+    ...(acceptError ? { walletError: acceptError } : {}),
+  };
+  const respSig = signRelayMessage(privKey, msg.from, 'service-response', responsePayload);
+  await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      from: identityKey, to: msg.from, type: 'service-response',
+      payload: responsePayload, signature: respSig,
+    }),
+  }, 15000);
+
+  return {
+    id: msg.id,
+    type: 'service-request',
+    serviceId: 'roulette',
+    action: 'fulfilled',
+    result: gameResult,
+    paymentAccepted: true,
+    paymentTxid,
+    satoshisReceived: paymentSats,
+    walletAccepted,
+    direction: 'incoming-request',
+    formatted: {
+      type: 'roulette',
+      summary: gameResult.message,
+      earnings: won ? -payout : actualBetAmount, // negative if we paid out
+    },
+    ...(acceptError ? { walletError: acceptError } : {}),
+    from: msg.from,
+    ack: true,
+  };
+}
+
+/**
+ * Spin the roulette wheel - returns a number 0-36
+ */
+function spinRouletteWheel() {
+  // Use crypto.getRandomValues for fairness
+  const randomBytes = new Uint8Array(4);
+  crypto.getRandomValues(randomBytes);
+  const randomInt = (randomBytes[0] << 24) | (randomBytes[1] << 16) | (randomBytes[2] << 8) | randomBytes[3];
+  const positiveInt = randomInt >>> 0; // Convert to unsigned
+  return positiveInt % 37; // 0-36
+}
+
+/**
+ * Evaluate a roulette bet against the spin result
+ * Returns { won: boolean, payout: number, multiplier: number }
+ */
+function evaluateRouletteBet(bet, spinResult, betAmount) {
+  // Single number bet (35:1)
+  if (typeof bet === 'number') {
+    if (bet === spinResult) {
+      return { won: true, payout: betAmount * 36, multiplier: 36 }; // 35:1 + original bet
+    }
+    return { won: false, payout: 0, multiplier: 0 };
+  }
+
+  // Named bets
+  switch (bet) {
+    case 'red':
+      if (RED_NUMBERS.includes(spinResult)) {
+        return { won: true, payout: betAmount * 2, multiplier: 2 };
+      }
+      return { won: false, payout: 0, multiplier: 0 };
+
+    case 'black':
+      if (BLACK_NUMBERS.includes(spinResult)) {
+        return { won: true, payout: betAmount * 2, multiplier: 2 };
+      }
+      return { won: false, payout: 0, multiplier: 0 };
+
+    case 'odd':
+      if (spinResult > 0 && spinResult % 2 === 1) {
+        return { won: true, payout: betAmount * 2, multiplier: 2 };
+      }
+      return { won: false, payout: 0, multiplier: 0 };
+
+    case 'even':
+      if (spinResult > 0 && spinResult % 2 === 0) {
+        return { won: true, payout: betAmount * 2, multiplier: 2 };
+      }
+      return { won: false, payout: 0, multiplier: 0 };
+
+    case 'low': // 1-18
+      if (spinResult >= 1 && spinResult <= 18) {
+        return { won: true, payout: betAmount * 2, multiplier: 2 };
+      }
+      return { won: false, payout: 0, multiplier: 0 };
+
+    case 'high': // 19-36
+      if (spinResult >= 19 && spinResult <= 36) {
+        return { won: true, payout: betAmount * 2, multiplier: 2 };
+      }
+      return { won: false, payout: 0, multiplier: 0 };
+
+    case '1st12': // 1-12
+      if (spinResult >= 1 && spinResult <= 12) {
+        return { won: true, payout: betAmount * 3, multiplier: 3 };
+      }
+      return { won: false, payout: 0, multiplier: 0 };
+
+    case '2nd12': // 13-24
+      if (spinResult >= 13 && spinResult <= 24) {
+        return { won: true, payout: betAmount * 3, multiplier: 3 };
+      }
+      return { won: false, payout: 0, multiplier: 0 };
+
+    case '3rd12': // 25-36
+      if (spinResult >= 25 && spinResult <= 36) {
+        return { won: true, payout: betAmount * 3, multiplier: 3 };
+      }
+      return { won: false, payout: 0, multiplier: 0 };
+
+    default:
+      return { won: false, payout: 0, multiplier: 0 };
+  }
+}
+
+/** Analyze a GitHub PR diff for common issues. */
+function analyzePrReview(prInfo, diff) {
+  const files = prInfo.files || [];
+  const findings = [];
+  const diffLines = diff.split('\n');
+  let currentFile = '';
+  let currentHunk = '';
+  let addedLines = 0;
+  let removedLines = 0;
+  let lineNum = 0;
+
+  // Per-file tracking
+  const fileStats = {};
+  const addedBlocks = {}; // file -> array of consecutive added lines
+
+  for (const line of diffLines) {
+    if (line.startsWith('diff --git')) {
+      currentFile = line.split(' b/')[1] || '';
+      if (!fileStats[currentFile]) fileStats[currentFile] = { added: 0, removed: 0, functions: [], imports: [] };
+    } else if (line.startsWith('@@')) {
+      currentHunk = line;
+      const match = line.match(/@@ .* \+(\d+)/);
+      lineNum = match ? parseInt(match[1]) - 1 : 0;
+    } else if (line.startsWith('+') && !line.startsWith('+++')) {
+      addedLines++;
+      lineNum++;
+      if (fileStats[currentFile]) fileStats[currentFile].added++;
+      const trimmed = line.slice(1).trim();
+
+      // ── Security checks ──
+      if (trimmed.includes('eval('))
+        findings.push({ severity: 'critical', file: currentFile, line: lineNum, detail: '`eval()` usage — potential code injection risk' });
+      if (trimmed.match(/\bexecSync\b|\bexec\b/) && trimmed.match(/\$\{|\+\s*\w/))
+        findings.push({ severity: 'critical', file: currentFile, line: lineNum, detail: 'Shell command with string interpolation — injection risk' });
+      if (trimmed.match(/password|secret|api_key|apikey|private_key|token/i) && !trimmed.match(/\/\/|^\s*\*|param|type|interface|@/))
+        findings.push({ severity: 'high', file: currentFile, line: lineNum, detail: 'Possible hardcoded secret or credential' });
+      if (trimmed.match(/https?:\/\/\d+\.\d+\.\d+\.\d+/))
+        findings.push({ severity: 'warning', file: currentFile, line: lineNum, detail: 'Hardcoded IP address — use config/env variable' });
+      if (trimmed.includes('dangerouslySetInnerHTML') || trimmed.includes('innerHTML'))
+        findings.push({ severity: 'high', file: currentFile, line: lineNum, detail: 'Direct HTML injection — XSS risk' });
+
+      // ── Error handling ──
+      if (trimmed.match(/catch\s*\([^)]*\)\s*\{\s*\}/) || trimmed.match(/catch\s*\{\s*\}/))
+        findings.push({ severity: 'warning', file: currentFile, line: lineNum, detail: 'Empty catch block — errors silently swallowed' });
+      if (trimmed.match(/catch\s*\([^)]*\)\s*\{\s*\/\//))
+        findings.push({ severity: 'info', file: currentFile, line: lineNum, detail: 'Catch block with only a comment — consider logging the error' });
+      if (trimmed.match(/\.then\(/) && !trimmed.match(/\.catch\(/))
+        findings.push({ severity: 'info', file: currentFile, line: lineNum, detail: 'Promise .then() without .catch() — unhandled rejection risk' });
+
+      // ── Code quality ──
+      if (trimmed.match(/console\.(log|debug|info)\(/))
+        findings.push({ severity: 'warning', file: currentFile, line: lineNum, detail: 'Debug logging left in — remove before merge' });
+      if (trimmed.match(/TODO|FIXME|HACK|XXX|TEMP/i))
+        findings.push({ severity: 'info', file: currentFile, line: lineNum, detail: `Marker comment: ${trimmed.slice(0, 100)}` });
+      if (trimmed.includes('var ') && !trimmed.match(/\/\/|^\s*\*/))
+        findings.push({ severity: 'info', file: currentFile, line: lineNum, detail: '`var` declaration — prefer `let` or `const`' });
+      if (line.length > 200)
+        findings.push({ severity: 'info', file: currentFile, line: lineNum, detail: `Line too long (${line.length} chars)` });
+      if (trimmed.match(/==\s/) && !trimmed.match(/===/) && !trimmed.match(/!==/) && !trimmed.match(/\/\//))
+        findings.push({ severity: 'warning', file: currentFile, line: lineNum, detail: 'Loose equality (`==`) — use strict equality (`===`)' });
+      if (trimmed.match(/\bany\b/) && currentFile.match(/\.ts$/))
+        findings.push({ severity: 'info', file: currentFile, line: lineNum, detail: '`any` type — consider a more specific type' });
+
+      // ── Reliability ──
+      if (trimmed.match(/fetch\(/) && !trimmed.match(/timeout|signal|AbortController/))
+        findings.push({ severity: 'warning', file: currentFile, line: lineNum, detail: 'fetch() without timeout — could hang indefinitely' });
+      if (trimmed.match(/JSON\.parse\(/) && !currentHunk.includes('try'))
+        findings.push({ severity: 'warning', file: currentFile, line: lineNum, detail: 'JSON.parse without try/catch — will throw on invalid input' });
+      if (trimmed.match(/fs\.(readFileSync|writeFileSync)/) && !currentHunk.includes('try'))
+        findings.push({ severity: 'info', file: currentFile, line: lineNum, detail: 'Sync file I/O without error handling' });
+
+      // ── Architecture ──
+      if (trimmed.match(/function\s+\w+/) || trimmed.match(/(const|let)\s+\w+\s*=\s*(async\s+)?\(/)) {
+        const fname = trimmed.match(/function\s+(\w+)/)?.[1] || trimmed.match(/(const|let)\s+(\w+)/)?.[2];
+        if (fname && fileStats[currentFile]) fileStats[currentFile].functions.push(fname);
+      }
+      if (trimmed.match(/^import\s/) || trimmed.match(/require\(/)) {
+        if (fileStats[currentFile]) fileStats[currentFile].imports.push(trimmed.slice(0, 80));
+      }
+    } else if (line.startsWith('-') && !line.startsWith('---')) {
+      removedLines++;
+      lineNum++;
+    } else {
+      lineNum++;
+    }
+  }
+
+  // ── Structural analysis ──
+  const suggestions = [];
+
+  // Large PR
+  if (addedLines > 500)
+    suggestions.push(`Large PR (+${addedLines} lines) — consider splitting into smaller, focused PRs for easier review`);
+  if (files.length > 10)
+    suggestions.push(`${files.length} files changed — verify all changes are related to the PR scope`);
+
+  // Single file dominance
+  const sortedFiles = Object.entries(fileStats).sort((a, b) => b[1].added - a[1].added);
+  if (sortedFiles.length > 1 && sortedFiles[0][1].added > addedLines * 0.8)
+    suggestions.push(`${sortedFiles[0][0]} has ${sortedFiles[0][1].added}/${addedLines} additions — consider if this file is getting too large`);
+
+  // Many new functions
+  const totalNewFunctions = Object.values(fileStats).reduce((sum, s) => sum + s.functions.length, 0);
+  if (totalNewFunctions > 10)
+    suggestions.push(`${totalNewFunctions} new functions added — ensure they're well-tested and documented`);
+
+  // File type analysis
+  const fileTypes = {};
+  for (const f of files) {
+    const ext = f.path?.split('.').pop() || 'unknown';
+    fileTypes[ext] = (fileTypes[ext] || 0) + 1;
+  }
+
+  // Test file check
+  const hasTests = files.some(f => f.path?.match(/test|spec|__tests__/i));
+  if (addedLines > 50 && !hasTests)
+    suggestions.push('No test files included — consider adding tests for new functionality');
+
+  // Deduplicate findings
+  const seen = new Set();
+  const uniqueFindings = findings.filter(f => {
+    const key = f.file + '|' + f.detail;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  // Build assessment
+  const criticalCount = uniqueFindings.filter(f => f.severity === 'critical').length;
+  const highCount = uniqueFindings.filter(f => f.severity === 'high').length;
+  const warningCount = uniqueFindings.filter(f => f.severity === 'warning').length;
+  const infoCount = uniqueFindings.filter(f => f.severity === 'info').length;
+
+  let overallAssessment;
+  if (criticalCount > 0)
+    overallAssessment = `🔴 ${criticalCount} critical issue(s) found — must be addressed before merging`;
+  else if (highCount > 0)
+    overallAssessment = `🟠 ${highCount} high-severity issue(s) — strongly recommend fixing before merge`;
+  else if (warningCount > 3)
+    overallAssessment = `🟡 ${warningCount} warnings — review and address where appropriate`;
+  else if (warningCount > 0)
+    overallAssessment = `🟢 Minor warnings only (${warningCount}) — looks good overall`;
+  else if (infoCount > 0)
+    overallAssessment = `✅ Clean — only informational notes (${infoCount})`;
+  else
+    overallAssessment = `✅ No issues found — LGTM`;
+
+  if (suggestions.length > 0)
+    overallAssessment += '\n\n**Suggestions:**\n' + suggestions.map(s => `- ${s}`).join('\n');
+
+  return {
+    type: 'code-review',
+    summary: `Review of PR: ${prInfo.title}`,
+    author: prInfo.author?.login || 'unknown',
+    filesReviewed: files.length,
+    linesChanged: `+${prInfo.additions || addedLines} / -${prInfo.deletions || removedLines}`,
+    fileTypes,
+    findings: uniqueFindings.slice(0, 30),
+    findingsSummary: { critical: criticalCount, high: highCount, warning: warningCount, info: infoCount },
+    suggestions,
+    overallAssessment,
+  };
+}
+
+/** Analyze a code snippet for common issues. */
+function analyzeCodeSnippet(code, language) {
+  const lines = code.split('\n');
+  const findings = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.includes('console.log'))
+      findings.push({ severity: 'warning', line: i + 1, detail: 'Debug logging' });
+    if (line.includes('TODO') || line.includes('FIXME'))
+      findings.push({ severity: 'info', line: i + 1, detail: line.trim() });
+    if (line.match(/catch\s*\(\s*\w*\s*\)\s*\{\s*\}/))
+      findings.push({ severity: 'warning', line: i + 1, detail: 'Empty catch block' });
+    if (line.includes('eval('))
+      findings.push({ severity: 'critical', line: i + 1, detail: 'eval() is a security risk' });
+    if (line.includes('var '))
+      findings.push({ severity: 'info', line: i + 1, detail: 'Use let/const instead of var' });
+    if (line.includes('password') || line.includes('secret') || line.includes('api_key'))
+      findings.push({ severity: 'critical', line: i + 1, detail: 'Potential secret/credential in code' });
+    if (line.match(/===?\s*null\b/) && !line.match(/!==?\s*null\b/))
+      findings.push({ severity: 'info', line: i + 1, detail: 'Null check — consider optional chaining' });
+  }
+
+  return {
+    type: 'code-review',
+    summary: `Code review (${language}, ${lines.length} lines)`,
+    language,
+    totalLines: lines.length,
+    findings: findings.slice(0, 20),
+    overallAssessment: findings.some(f => f.severity === 'critical')
+      ? 'Critical issues found'
+      : findings.length > 3
+        ? 'Several items to review'
+        : 'Looks reasonable',
+  };
+}
+
 /** Handle a tell-joke service request with payment verification. */
 async function processJokeRequest(msg, identityKey, privKey) {
-  const payment = msg.payload?.payment;
+  const PRICE = 5;
 
   // Helper to send rejection
   async function reject(reason, shortReason) {
@@ -1480,152 +3360,18 @@ async function processJokeRequest(msg, identityKey, privKey) {
     };
   }
 
-  if (!payment || !payment.beef || !payment.satoshis) {
-    return reject('No payment included. This service costs 5 sats.', 'no payment');
-  }
-  if (payment.satoshis < 5) {
-    return reject(
-      `Insufficient payment: ${payment.satoshis} sats sent, 5 required.`,
-      `underpaid: ${payment.satoshis} < 5`,
-    );
+  // ── Payment verification via shared helper ──
+  const walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+  const ourHash160 = Hash.hash160(PrivateKey.fromHex(walletIdentity.rootKeyHex).toPublicKey().encode(true));
+  const payResult = await verifyAndAcceptPayment(msg.payload?.payment, PRICE, msg.from, 'tell-joke', ourHash160);
+  if (!payResult.accepted) {
+    return reject(`Payment rejected: ${payResult.error}. This service costs ${PRICE} sats.`, payResult.error);
   }
 
-  // Decode BEEF
-  let beefBytes;
-  try {
-    beefBytes = Uint8Array.from(atob(payment.beef), c => c.charCodeAt(0));
-  } catch { beefBytes = null; }
-
-  if (!beefBytes || beefBytes.length < 20) {
-    return reject('Invalid payment BEEF. Could not decode base64.', 'invalid base64');
-  }
-
-  // Parse the payment transaction
-  let paymentTx = null;
-  let isAtomicBeef = false;
-  try { paymentTx = Transaction.fromAtomicBEEF(Array.from(beefBytes)); isAtomicBeef = true; } catch {}
-  if (!paymentTx) {
-    try {
-      const beefObj = Beef.fromBinary(Array.from(beefBytes));
-      const txs = beefObj.txs || [];
-      const newest = txs.find(t => t.tx) || txs[txs.length - 1];
-      paymentTx = newest?.tx || null;
-    } catch {}
-  }
-  if (!paymentTx) {
-    return reject('Invalid payment BEEF. Could not parse transaction.', 'unparseable BEEF');
-  }
-
-  // Find the output that pays us
-  const identityPath = path.join(WALLET_DIR, 'wallet-identity.json');
-  const walletIdentity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
-  const ourPrivKey = PrivateKey.fromHex(walletIdentity.rootKeyHex);
-  const ourPubKey = ourPrivKey.toPublicKey();
-  const ourHash160 = Hash.hash160(ourPubKey.encode(true));
-  const ourHash160Hex = Array.from(ourHash160).map(b => b.toString(16).padStart(2, '0')).join('');
-
-  let paymentOutputIndex = -1;
-  let paymentSats = 0;
-  for (let i = 0; i < paymentTx.outputs.length; i++) {
-    const scriptHex = paymentTx.outputs[i].lockingScript.toHex();
-    if (scriptHex.includes(ourHash160Hex)) {
-      paymentOutputIndex = i;
-      paymentSats = paymentTx.outputs[i].satoshis;
-      break;
-    }
-  }
-  if (paymentOutputIndex < 0) {
-    return reject('No output paying our address found in the transaction.', 'no output to us');
-  }
-  if (paymentSats < 5) {
-    return reject(`Output pays ${paymentSats} sats, minimum 5 required.`, `underpaid: ${paymentSats}`);
-  }
-
-  // Accept the payment into our wallet
-  const paymentTxid = paymentTx.id('hex');
-  let walletAccepted = false;
-  let acceptError = null;
-
-  const derivPrefix = payment.derivationPrefix || Utils.toBase64(Array.from(new TextEncoder().encode('service-payment')));
-  const derivSuffix = payment.derivationSuffix || Utils.toBase64(Array.from(new TextEncoder().encode(paymentTxid.slice(0, 16))));
-  const internalizeArgs = {
-    outputs: [{
-      outputIndex: paymentOutputIndex,
-      protocol: 'wallet payment',
-      paymentRemittance: {
-        derivationPrefix: derivPrefix, derivationSuffix: derivSuffix,
-        senderIdentityKey: msg.from,
-      },
-    }],
-    description: `Payment for tell-joke from ${msg.from.slice(0, 12)}...`,
-  };
-
-  // Attempt 1: use the BEEF bytes directly from sender
-  try {
-    const wallet = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
-    let atomicBytes;
-    if (isAtomicBeef) {
-      atomicBytes = new Uint8Array(beefBytes);
-    } else {
-      const beefObj = Beef.fromBinary(Array.from(beefBytes));
-      atomicBytes = beefObj.toBinaryAtomic(paymentTxid);
-    }
-    await wallet._setup.wallet.storage.internalizeAction({ tx: atomicBytes, ...internalizeArgs });
-    await wallet.destroy();
-    walletAccepted = true;
-  } catch (err1) {
-    // Attempt 2: rebuild BEEF from WhatsonChain
-    try {
-      const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
-      const wocBase = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
-      const txChain = [];
-      let curTxid = paymentTxid;
-      let curTx = paymentTx;
-      txChain.push({ tx: curTx, txid: curTxid });
-
-      for (let depth = 0; depth < 10; depth++) {
-        const srcTxid = curTx.inputs[0].sourceTXID;
-        const srcHexResp = await fetch(`${wocBase}/tx/${srcTxid}/hex`);
-        if (!srcHexResp.ok) throw new Error(`WoC tx hex ${srcTxid.slice(0,12)}: ${srcHexResp.status}`);
-        const srcHex = await srcHexResp.text();
-        const srcTx = Transaction.fromHex(srcHex);
-
-        const srcInfoResp = await fetch(`${wocBase}/tx/${srcTxid}`);
-        if (!srcInfoResp.ok) throw new Error(`WoC tx info ${srcTxid.slice(0,12)}: ${srcInfoResp.status}`);
-        const srcInfo = await srcInfoResp.json();
-
-        if (srcInfo.confirmations > 0 && srcInfo.blockheight) {
-          const proofResp = await fetch(`${wocBase}/tx/${srcTxid}/proof/tsc`);
-          if (proofResp.ok) {
-            const proofData = await proofResp.json();
-            if (Array.isArray(proofData) && proofData.length > 0) {
-              const proof = proofData[0];
-              srcTx.merklePath = buildMerklePathFromTSC(srcTxid, proof.index, proof.nodes, srcInfo.blockheight);
-            }
-          }
-          txChain.push({ tx: srcTx, txid: srcTxid });
-          break;
-        }
-        txChain.push({ tx: srcTx, txid: srcTxid });
-        curTx = srcTx;
-        curTxid = srcTxid;
-      }
-
-      const freshBeef = new Beef();
-      for (let i = txChain.length - 1; i >= 0; i--) {
-        freshBeef.mergeTransaction(txChain[i].tx);
-      }
-      const freshAtomicBytes = new Uint8Array(freshBeef.toBinaryAtomic(paymentTxid));
-
-      const wallet2 = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
-      await wallet2._setup.wallet.storage.internalizeAction({ tx: freshAtomicBytes, ...internalizeArgs });
-      await wallet2.destroy();
-      walletAccepted = true;
-      acceptError = null;
-    } catch (err2) {
-      acceptError = `Attempt 1: ${err1 instanceof Error ? err1.message : String(err1)} | Attempt 2: ${err2 instanceof Error ? err2.message : String(err2)}`;
-    }
-  }
+  const paymentTxid = payResult.txid;
+  const paymentSats = payResult.satoshis;
+  const walletAccepted = payResult.walletAccepted;
+  const acceptError = payResult.error;
 
   // Serve the joke
   const joke = JOKES[Math.floor(Math.random() * JOKES.length)];
@@ -1649,6 +3395,12 @@ async function processJokeRequest(msg, identityKey, privKey) {
     id: msg.id, type: 'service-request', serviceId: 'tell-joke',
     action: 'fulfilled', joke, paymentAccepted: true, paymentTxid,
     satoshisReceived: paymentSats, walletAccepted,
+    direction: 'incoming-request', // We received a request and earned sats
+    formatted: {
+      type: 'joke-fulfilled',
+      summary: `Joke served: "${joke.setup}" — "${joke.punchline}"`,
+      earnings: paymentSats,
+    },
     ...(acceptError ? { walletError: acceptError } : {}),
     from: msg.from, ack: true,
   };
@@ -1752,6 +3504,13 @@ async function cmdConnect() {
           const result = await processMessage(envelope.message, identityKey, privKey);
           // Output the result as a JSON line to stdout
           console.log(JSON.stringify(result));
+
+          // Also append to notification log for external consumers (cron, etc.)
+          const notifPath = path.join(OVERLAY_STATE_DIR, 'notifications.jsonl');
+          try {
+            fs.mkdirSync(OVERLAY_STATE_DIR, { recursive: true });
+            fs.appendFileSync(notifPath, JSON.stringify({ ...result, _ts: Date.now() }) + '\n');
+          } catch {}
           // Ack the message
           if (result.ack) {
             try {
@@ -1764,6 +3523,27 @@ async function cmdConnect() {
               console.error(JSON.stringify({ event: 'ack-error', id: result.id, message: String(ackErr) }));
             }
           }
+        }
+        // Handle service announcements from the overlay
+        if (envelope.type === 'service-announced') {
+          const svc = envelope.service || {};
+          const announcement = {
+            event: 'service-announced',
+            serviceId: svc.serviceId,
+            name: svc.name,
+            description: svc.description,
+            priceSats: svc.pricingSats,
+            provider: svc.identityKey,
+            txid: envelope.txid,
+            _ts: Date.now(),
+          };
+          console.log(JSON.stringify(announcement));
+          // Also write to notification log
+          const notifPath = path.join(OVERLAY_STATE_DIR, 'notifications.jsonl');
+          try {
+            fs.mkdirSync(OVERLAY_STATE_DIR, { recursive: true });
+            fs.appendFileSync(notifPath, JSON.stringify(announcement) + '\n');
+          } catch {}
         }
         // Ignore 'connected' type — just informational
       } catch (err) {
@@ -1790,9 +3570,84 @@ async function cmdConnect() {
   await new Promise(() => {});
 }
 
-async function cmdRequestService(targetKey, serviceId, satsStr) {
+// ---------------------------------------------------------------------------
+// research-queue / research-respond — Clawdbot processes web research via its tools
+// ---------------------------------------------------------------------------
+
+async function cmdResearchQueue() {
+  const queuePath = path.join(OVERLAY_STATE_DIR, 'research-queue.jsonl');
+  if (!fs.existsSync(queuePath)) return ok({ pending: [] });
+  const lines = fs.readFileSync(queuePath, 'utf-8').trim().split('\n').filter(Boolean);
+  const entries = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  ok({ pending: entries, count: entries.length });
+}
+
+async function cmdResearchRespond(resultJsonPath) {
+  if (!resultJsonPath) return fail('Usage: research-respond <resultJsonFile>');
+  if (!fs.existsSync(resultJsonPath)) return fail(`File not found: ${resultJsonPath}`);
+
+  const result = JSON.parse(fs.readFileSync(resultJsonPath, 'utf-8'));
+  const { requestId, from: recipientKey, query, research } = result;
+
+  if (!requestId || !recipientKey || !research) {
+    return fail('Result JSON must have: requestId, from, query, research');
+  }
+
+  // Load identity
+  const identityPath = path.join(WALLET_DIR, 'wallet-identity.json');
+  if (!fs.existsSync(identityPath)) return fail('Wallet not initialized.');
+  const identity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
+  const privKey = PrivateKey.fromHex(identity.rootKeyHex);
+  const identityKey = privKey.toPublicKey().toString();
+  const relayPrivHex = identity.relayKeyHex || identity.rootKeyHex;
+  const relayPrivKey = PrivateKey.fromHex(relayPrivHex);
+
+  const responsePayload = {
+    requestId,
+    serviceId: 'web-research',
+    status: 'fulfilled',
+    result: research,
+    paymentAccepted: true,
+    paymentTxid: result.paymentTxid || null,
+    satoshisReceived: result.satoshisReceived || 0,
+    walletAccepted: result.walletAccepted ?? true,
+  };
+
+  const sig = signRelayMessage(relayPrivKey, recipientKey, 'service-response', responsePayload);
+  const sendResp = await fetch(`${OVERLAY_URL}/relay/send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      from: identityKey,
+      to: recipientKey,
+      type: 'service-response',
+      payload: responsePayload,
+      signature: sig,
+    }),
+  });
+
+  if (!sendResp.ok) {
+    return fail(`Failed to send response: ${await sendResp.text()}`);
+  }
+
+  const sendResult = await sendResp.json();
+
+  // Remove from queue
+  const queuePath = path.join(OVERLAY_STATE_DIR, 'research-queue.jsonl');
+  if (fs.existsSync(queuePath)) {
+    const lines = fs.readFileSync(queuePath, 'utf-8').trim().split('\n').filter(Boolean);
+    const remaining = lines.filter(l => {
+      try { return JSON.parse(l).requestId !== requestId; } catch { return true; }
+    });
+    fs.writeFileSync(queuePath, remaining.length ? remaining.join('\n') + '\n' : '');
+  }
+
+  ok({ responded: true, requestId, to: recipientKey, query, pushed: sendResult.pushed });
+}
+
+async function cmdRequestService(targetKey, serviceId, satsStr, inputJsonStr) {
   if (!targetKey || !serviceId) {
-    return fail('Usage: request-service <identityKey> <serviceId> [sats]');
+    return fail('Usage: request-service <identityKey> <serviceId> [sats] [inputJson]');
   }
   if (!/^0[23][0-9a-fA-F]{64}$/.test(targetKey)) {
     return fail('Target must be a compressed public key (66 hex chars, 02/03 prefix)');
@@ -1800,6 +3655,16 @@ async function cmdRequestService(targetKey, serviceId, satsStr) {
 
   const { identityKey, privKey } = loadIdentity();
   const sats = parseInt(satsStr || '5', 10);
+
+  // Parse optional input JSON
+  let inputData = null;
+  if (inputJsonStr) {
+    try {
+      inputData = JSON.parse(inputJsonStr);
+    } catch {
+      return fail('inputJson must be valid JSON');
+    }
+  }
 
   // Build the service request payload
   let paymentData = null;
@@ -1823,6 +3688,7 @@ async function cmdRequestService(targetKey, serviceId, satsStr) {
 
   const requestPayload = {
     serviceId,
+    ...(inputData ? { input: inputData } : {}),
     payment: paymentData,
     requestedAt: new Date().toISOString(),
   };
@@ -1896,10 +3762,12 @@ try {
     case 'ack':               await cmdAck(args); break;
     case 'poll':              await cmdPoll(); break;
     case 'connect':           await cmdConnect(); break;
-    case 'request-service':   await cmdRequestService(args[0], args[1], args[2]); break;
+    case 'request-service':   await cmdRequestService(args[0], args[1], args[2], args[3]); break;
+    case 'research-respond':  await cmdResearchRespond(args[0]); break;
+    case 'research-queue':    await cmdResearchQueue(); break;
 
     default:
-      fail(`Unknown command: ${command || '(none)'}. Commands: setup, identity, address, balance, import, refund, register, unregister, services, advertise, remove, discover, pay, verify, accept, send, inbox, ack, poll, connect, request-service`);
+      fail(`Unknown command: ${command || '(none)'}. Commands: setup, identity, address, balance, import, refund, register, unregister, services, advertise, remove, discover, pay, verify, accept, send, inbox, ack, poll, connect, request-service, research-queue, research-respond`);
   }
 } catch (err) {
   fail(err instanceof Error ? err.message : String(err));

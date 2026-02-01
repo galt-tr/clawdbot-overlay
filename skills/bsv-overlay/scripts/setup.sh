@@ -78,6 +78,9 @@ CLI="$SCRIPT_DIR/overlay-cli.mjs"
 if [ -f "$CLI" ]; then
   echo "🔑 Initializing wallet..."
   node "$CLI" setup 2>&1 || true
+  # Issue #8: Restrict permissions on wallet identity (contains private key)
+  WALLET_IDENTITY="${BSV_WALLET_DIR:-$HOME/.clawdbot/bsv-wallet}/wallet-identity.json"
+  [ -f "$WALLET_IDENTITY" ] && chmod 600 "$WALLET_IDENTITY" && echo "🔒 Set 0600 on wallet-identity.json"
   echo ""
   echo "📬 Wallet address:"
   node "$CLI" address 2>&1 || true
