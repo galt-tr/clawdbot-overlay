@@ -822,96 +822,31 @@ async function verifyAndAcceptPayment(payment, minSats, senderKey, serviceId, re
   result.outputIndex = paymentOutputIndex;
   result.accepted = true;
 
-  // Prepare wallet internalization args
-  const derivPrefix = payment.derivationPrefix || 
-    Utils.toBase64(Array.from(new TextEncoder().encode('service-payment')));
-  const derivSuffix = payment.derivationSuffix || 
-    Utils.toBase64(Array.from(new TextEncoder().encode(result.txid.slice(0, 16))));
-  
-  const internalizeArgs = {
-    outputs: [{
-      outputIndex: paymentOutputIndex,
-      protocol: 'wallet payment',
-      paymentRemittance: {
-        derivationPrefix: derivPrefix,
-        derivationSuffix: derivSuffix,
-        senderIdentityKey: senderKey,
-      },
-    }],
-    description: `Payment for ${serviceId} from ${senderKey.slice(0, 12)}...`,
-  };
-
-  // Attempt 1: Use BEEF bytes directly
+  // ── Accept payment: store the BEEF for later spending ──
+  // The sender's BEEF contains the full proof chain. We just need to save it
+  // so we can spend this output later (BEEF-first approach, no WoC needed).
   try {
-    const wallet = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
-    let atomicBytes;
-    if (isAtomicBeef) {
-      atomicBytes = new Uint8Array(beefBytes);
-    } else {
-      const beefObj = Beef.fromBinary(Array.from(beefBytes));
-      atomicBytes = new Uint8Array(beefObj.toBinaryAtomic(result.txid));
-    }
-    await wallet._setup.wallet.storage.internalizeAction({ tx: atomicBytes, ...internalizeArgs });
-    await wallet.destroy();
+    // Store the received payment BEEF as a spendable UTXO
+    const paymentStorePath = path.join(OVERLAY_STATE_DIR, 'received-payments.jsonl');
+    fs.mkdirSync(OVERLAY_STATE_DIR, { recursive: true });
+
+    // Reconstruct the payment tx with its source chain from the BEEF
+    // The sender's BEEF has the full ancestry — preserve it
+    const entry = {
+      txid: result.txid,
+      vout: paymentOutputIndex,
+      satoshis: paymentSats,
+      beefBase64: payment.beef,  // Keep the original BEEF from sender
+      serviceId,
+      from: senderKey,
+      ts: Date.now(),
+    };
+    fs.appendFileSync(paymentStorePath, JSON.stringify(entry) + '\n');
     result.walletAccepted = true;
-    return result;
-  } catch (err1) {
-    // Attempt 2: Rebuild BEEF from WhatsonChain
-    try {
-      const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
-      const wocBase = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
-      
-      // Build tx chain with merkle proofs
-      const txChain = [];
-      let currentTxid = result.txid;
-      
-      for (let depth = 0; depth < 5 && currentTxid; depth++) {
-        const txResp = await fetchWithTimeout(`${wocBase}/tx/${currentTxid}/hex`, {}, 10000);
-        if (!txResp.ok) break;
-        const txHex = await txResp.text();
-        const tx = Transaction.fromHex(txHex);
-        
-        const infoResp = await fetchWithTimeout(`${wocBase}/tx/${currentTxid}`, {}, 10000);
-        if (infoResp.ok) {
-          const info = await infoResp.json();
-          if (info.blockheight && info.confirmations > 0) {
-            const proofResp = await fetchWithTimeout(`${wocBase}/tx/${currentTxid}/proof/tsc`, {}, 10000);
-            if (proofResp.ok) {
-              const proofData = await proofResp.json();
-              if (Array.isArray(proofData) && proofData.length > 0) {
-                const proof = proofData[0];
-                tx.merklePath = buildMerklePathFromTSC(currentTxid, proof.index, proof.nodes, info.blockheight);
-              }
-            }
-          }
-        }
-        
-        txChain.push({ txid: currentTxid, tx });
-        
-        // Get parent txid from first input
-        if (tx.inputs.length > 0 && tx.inputs[0].sourceTXID) {
-          currentTxid = tx.inputs[0].sourceTXID;
-        } else {
-          break;
-        }
-      }
-      
-      // Build fresh BEEF
-      const freshBeef = new Beef();
-      for (let i = txChain.length - 1; i >= 0; i--) {
-        freshBeef.mergeTransaction(txChain[i].tx);
-      }
-      const freshAtomicBytes = new Uint8Array(freshBeef.toBinaryAtomic(result.txid));
-      
-      const wallet2 = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
-      await wallet2._setup.wallet.storage.internalizeAction({ tx: freshAtomicBytes, ...internalizeArgs });
-      await wallet2.destroy();
-      result.walletAccepted = true;
-    } catch (err2) {
-      result.error = `wallet internalization failed: ${err1.message} | ${err2.message}`;
-    }
+  } catch (err) {
+    result.error = `payment store failed: ${err.message}`;
   }
-  
+
   return result;
 }
 
@@ -2031,7 +1966,7 @@ async function processMessage(msg, identityKey, privKey) {
 // ---------------------------------------------------------------------------
 
 async function processCodeReview(msg, identityKey, privKey) {
-  const payment = msg.payload?.payment;
+  const PRICE = 50;
 
   // Helper to send rejection
   async function reject(reason, shortReason) {
@@ -2053,150 +1988,18 @@ async function processCodeReview(msg, identityKey, privKey) {
     };
   }
 
-  if (!payment || !payment.beef || !payment.satoshis) {
-    return reject('No payment included. This service costs 50 sats.', 'no payment');
-  }
-  if (payment.satoshis < 50) {
-    return reject(
-      `Insufficient payment: ${payment.satoshis} sats sent, 50 required.`,
-      `underpaid: ${payment.satoshis} < 50`,
-    );
+  // ── Payment verification via shared helper ──
+  const walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+  const ourHash160 = Hash.hash160(PrivateKey.fromHex(walletIdentity.rootKeyHex).toPublicKey().encode(true));
+  const payResult = await verifyAndAcceptPayment(msg.payload?.payment, PRICE, msg.from, 'code-review', ourHash160);
+  if (!payResult.accepted) {
+    return reject(`Payment rejected: ${payResult.error}. This service costs ${PRICE} sats.`, payResult.error);
   }
 
-  // Decode BEEF
-  let beefBytes;
-  try {
-    beefBytes = Uint8Array.from(atob(payment.beef), c => c.charCodeAt(0));
-  } catch { beefBytes = null; }
-
-  if (!beefBytes || beefBytes.length < 20) {
-    return reject('Invalid payment BEEF. Could not decode base64.', 'invalid base64');
-  }
-
-  // Parse the payment transaction
-  let paymentTx = null;
-  let isAtomicBeef = false;
-  try { paymentTx = Transaction.fromAtomicBEEF(Array.from(beefBytes)); isAtomicBeef = true; } catch {}
-  if (!paymentTx) {
-    try {
-      const beefObj = Beef.fromBinary(Array.from(beefBytes));
-      const txs = beefObj.txs || [];
-      const newest = txs.find(t => t.tx) || txs[txs.length - 1];
-      paymentTx = newest?.tx || null;
-    } catch {}
-  }
-  if (!paymentTx) {
-    return reject('Invalid payment BEEF. Could not parse transaction.', 'unparseable BEEF');
-  }
-
-  // Find the output that pays us
-  const identityPath = path.join(WALLET_DIR, 'wallet-identity.json');
-  const walletIdentity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
-  const ourPrivKey = PrivateKey.fromHex(walletIdentity.rootKeyHex);
-  const ourPubKey = ourPrivKey.toPublicKey();
-  const ourHash160 = Hash.hash160(ourPubKey.encode(true));
-  const ourHash160Hex = Array.from(ourHash160).map(b => b.toString(16).padStart(2, '0')).join('');
-
-  let paymentOutputIndex = -1;
-  let paymentSats = 0;
-  for (let i = 0; i < paymentTx.outputs.length; i++) {
-    const scriptHex = paymentTx.outputs[i].lockingScript.toHex();
-    if (scriptHex.includes(ourHash160Hex)) {
-      paymentOutputIndex = i;
-      paymentSats = paymentTx.outputs[i].satoshis;
-      break;
-    }
-  }
-  if (paymentOutputIndex < 0) {
-    return reject('No output paying our address found in the transaction.', 'no output to us');
-  }
-  if (paymentSats < 50) {
-    return reject(`Output pays ${paymentSats} sats, minimum 50 required.`, `underpaid: ${paymentSats}`);
-  }
-
-  // Accept the payment into our wallet
-  const paymentTxid = paymentTx.id('hex');
-  let walletAccepted = false;
-  let acceptError = null;
-
-  const derivPrefix = payment.derivationPrefix || Utils.toBase64(Array.from(new TextEncoder().encode('service-payment')));
-  const derivSuffix = payment.derivationSuffix || Utils.toBase64(Array.from(new TextEncoder().encode(paymentTxid.slice(0, 16))));
-  const internalizeArgs = {
-    outputs: [{
-      outputIndex: paymentOutputIndex,
-      protocol: 'wallet payment',
-      paymentRemittance: {
-        derivationPrefix: derivPrefix, derivationSuffix: derivSuffix,
-        senderIdentityKey: msg.from,
-      },
-    }],
-    description: `Payment for code-review from ${msg.from.slice(0, 12)}...`,
-  };
-
-  try {
-    const wallet = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
-    let atomicBytes;
-    if (isAtomicBeef) {
-      atomicBytes = new Uint8Array(beefBytes);
-    } else {
-      const beefObj = Beef.fromBinary(Array.from(beefBytes));
-      atomicBytes = beefObj.toBinaryAtomic(paymentTxid);
-    }
-    await wallet._setup.wallet.storage.internalizeAction({ tx: atomicBytes, ...internalizeArgs });
-    await wallet.destroy();
-    walletAccepted = true;
-  } catch (err1) {
-    try {
-      const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
-      const wocBase = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
-      const txChain = [];
-      let curTxid = paymentTxid;
-      let curTx = paymentTx;
-      txChain.push({ tx: curTx, txid: curTxid });
-
-      for (let depth = 0; depth < 10; depth++) {
-        const srcTxid = curTx.inputs[0].sourceTXID;
-        const srcHexResp = await wocFetch(`/tx/${srcTxid}/hex`);
-        if (!srcHexResp.ok) throw new Error(`WoC tx hex ${srcTxid.slice(0,12)}: ${srcHexResp.status}`);
-        const srcHex = await srcHexResp.text();
-        const srcTx = Transaction.fromHex(srcHex);
-
-        const srcInfoResp = await wocFetch(`/tx/${srcTxid}`);
-        if (!srcInfoResp.ok) throw new Error(`WoC tx info ${srcTxid.slice(0,12)}: ${srcInfoResp.status}`);
-        const srcInfo = await srcInfoResp.json();
-
-        if (srcInfo.confirmations > 0 && srcInfo.blockheight) {
-          const proofResp = await wocFetch(`/tx/${srcTxid}/proof/tsc`);
-          if (proofResp.ok) {
-            const proofData = await proofResp.json();
-            if (Array.isArray(proofData) && proofData.length > 0) {
-              const proof = proofData[0];
-              srcTx.merklePath = buildMerklePathFromTSC(srcTxid, proof.index, proof.nodes, srcInfo.blockheight);
-            }
-          }
-          txChain.push({ tx: srcTx, txid: srcTxid });
-          break;
-        }
-        txChain.push({ tx: srcTx, txid: srcTxid });
-        curTx = srcTx;
-        curTxid = srcTxid;
-      }
-
-      const freshBeef = new Beef();
-      for (let i = txChain.length - 1; i >= 0; i--) {
-        freshBeef.mergeTransaction(txChain[i].tx);
-      }
-      const freshAtomicBytes = new Uint8Array(freshBeef.toBinaryAtomic(paymentTxid));
-
-      const wallet2 = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
-      await wallet2._setup.wallet.storage.internalizeAction({ tx: freshAtomicBytes, ...internalizeArgs });
-      await wallet2.destroy();
-      walletAccepted = true;
-      acceptError = null;
-    } catch (err2) {
-      acceptError = `Attempt 1: ${err1 instanceof Error ? err1.message : String(err1)} | Attempt 2: ${err2 instanceof Error ? err2.message : String(err2)}`;
-    }
-  }
+  const paymentTxid = payResult.txid;
+  const paymentSats = payResult.satoshis;
+  const walletAccepted = payResult.walletAccepted;
+  const acceptError = payResult.error;
 
   // Perform the code review
   const input = msg.payload?.input || msg.payload;
@@ -2378,138 +2181,21 @@ async function processWebResearch(msg, identityKey, privKey) {
     return { id: msg.id, type: 'service-request', serviceId: 'web-research', action: 'rejected', reason: 'no query', from: msg.from, ack: true };
   }
 
-  // ── Payment verification (same pattern as other services) ──
-  if (!payment || !payment.beef || !payment.satoshis) {
-    const rejectPayload = {
-      requestId: msg.id,
-      serviceId: 'web-research',
-      status: 'rejected',
-      reason: `No payment included. Web research costs ${PRICE} sats.`,
-    };
-    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
-    await fetch(`${OVERLAY_URL}/relay/send`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
-    });
-    return { id: msg.id, type: 'service-request', serviceId: 'web-research', action: 'rejected', reason: 'no payment', from: msg.from, ack: true };
-  }
-
-  if (payment.satoshis < PRICE) {
-    const rejectPayload = {
-      requestId: msg.id,
-      serviceId: 'web-research',
-      status: 'rejected',
-      reason: `Insufficient payment: ${payment.satoshis} sats sent, ${PRICE} required.`,
-    };
-    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
-    await fetch(`${OVERLAY_URL}/relay/send`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
-    });
-    return { id: msg.id, type: 'service-request', serviceId: 'web-research', action: 'rejected', reason: `underpaid: ${payment.satoshis} < ${PRICE}`, from: msg.from, ack: true };
-  }
-
-  // ── Validate BEEF ──
-  let beefBytes;
-  try { beefBytes = Uint8Array.from(atob(payment.beef), c => c.charCodeAt(0)); } catch { beefBytes = null; }
-  let paymentTx = null;
-  let isAtomicBeef = false;
-  if (beefBytes && beefBytes.length > 20) {
-    try { paymentTx = Transaction.fromAtomicBEEF(Array.from(beefBytes)); isAtomicBeef = true; } catch {}
-    if (!paymentTx) try { const b = Beef.fromBinary(Array.from(beefBytes)); paymentTx = b.txs?.find(t => t.tx)?.tx; } catch {}
-  }
-  if (!paymentTx) {
-    const rejectPayload = { requestId: msg.id, serviceId: 'web-research', status: 'rejected', reason: 'Invalid payment BEEF.' };
+  // ── Payment verification via shared helper ──
+  const walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+  const ourHash160 = Hash.hash160(PrivateKey.fromHex(walletIdentity.rootKeyHex).toPublicKey().encode(true));
+  const payResult = await verifyAndAcceptPayment(payment, PRICE, msg.from, 'web-research', ourHash160);
+  if (!payResult.accepted) {
+    const rejectPayload = { requestId: msg.id, serviceId: 'web-research', status: 'rejected', reason: `Payment rejected: ${payResult.error}. Web research costs ${PRICE} sats.` };
     const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
     await fetch(`${OVERLAY_URL}/relay/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }) });
-    return { id: msg.id, type: 'service-request', serviceId: 'web-research', action: 'rejected', reason: 'invalid BEEF', from: msg.from, ack: true };
+    return { id: msg.id, type: 'service-request', serviceId: 'web-research', action: 'rejected', reason: payResult.error, from: msg.from, ack: true };
   }
 
-  // ── Find our output & accept payment ──
-  const identityPath = path.join(WALLET_DIR, 'wallet-identity.json');
-  const walletIdentity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
-  const ourPrivKey = PrivateKey.fromHex(walletIdentity.rootKeyHex);
-  const ourPubKey = ourPrivKey.toPublicKey();
-  const ourHash160 = Hash.hash160(ourPubKey.encode(true));
-  const ourHash160Hex = Array.from(ourHash160).map(b => b.toString(16).padStart(2, '0')).join('');
-
-  let paymentOutputIndex = -1;
-  let paymentSats = 0;
-  for (let i = 0; i < paymentTx.outputs.length; i++) {
-    const scriptHex = paymentTx.outputs[i].lockingScript.toHex();
-    if (scriptHex.includes(ourHash160Hex)) { paymentOutputIndex = i; paymentSats = paymentTx.outputs[i].satoshis; break; }
-  }
-  if (paymentOutputIndex < 0 || paymentSats < PRICE) {
-    const rejectPayload = { requestId: msg.id, serviceId: 'web-research', status: 'rejected', reason: paymentOutputIndex < 0 ? 'No output paying our address.' : `Output pays ${paymentSats} sats, ${PRICE} required.` };
-    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
-    await fetch(`${OVERLAY_URL}/relay/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }) });
-    return { id: msg.id, type: 'service-request', serviceId: 'web-research', action: 'rejected', reason: paymentOutputIndex < 0 ? 'no output to us' : `underpaid output: ${paymentSats}`, from: msg.from, ack: true };
-  }
-
-  const paymentTxid = paymentTx.id('hex');
-
-  // Accept into wallet
-  let walletAccepted = false;
-  let acceptError = null;
-  const derivPrefix = Utils.toBase64(Array.from(new TextEncoder().encode('web-research')));
-  const derivSuffix = Utils.toBase64(Array.from(new TextEncoder().encode(paymentTxid.slice(0, 16))));
-  try {
-    const wallet = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
-    const atomicBytes = isAtomicBeef ? new Uint8Array(beefBytes) : new Uint8Array(Beef.fromBinary(Array.from(beefBytes)).toBinaryAtomic(paymentTxid));
-    await wallet._setup.wallet.storage.internalizeAction({
-      tx: atomicBytes,
-      outputs: [{ outputIndex: paymentOutputIndex, protocol: 'wallet payment', paymentRemittance: { derivationPrefix: derivPrefix, derivationSuffix: derivSuffix, senderIdentityKey: msg.from } }],
-      description: `Web research payment from ${msg.from.slice(0, 12)}...`,
-    });
-    await wallet.destroy();
-    walletAccepted = true;
-  } catch (err1) {
-    try {
-      const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
-      const wocBase = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
-      const txChain = [];
-      let curTx = paymentTx;
-      let curTxid = paymentTxid;
-      txChain.push({ tx: curTx, txid: curTxid });
-      for (let depth = 0; depth < 10; depth++) {
-        const srcTxid = curTx.inputs[0].sourceTXID;
-        const srcHexResp = await wocFetch(`/tx/${srcTxid}/hex`);
-        if (!srcHexResp.ok) throw new Error(`WoC ${srcHexResp.status}`);
-        const srcTx = Transaction.fromHex(await srcHexResp.text());
-        const srcInfoResp = await wocFetch(`/tx/${srcTxid}`);
-        if (!srcInfoResp.ok) throw new Error(`WoC ${srcInfoResp.status}`);
-        const srcInfo = await srcInfoResp.json();
-        if (srcInfo.confirmations > 0 && srcInfo.blockheight) {
-          const proofResp = await wocFetch(`/tx/${srcTxid}/proof/tsc`);
-          if (proofResp.ok) {
-            const pd = await proofResp.json();
-            if (Array.isArray(pd) && pd.length > 0) srcTx.merklePath = buildMerklePathFromTSC(srcTxid, pd[0].index, pd[0].nodes, srcInfo.blockheight);
-          }
-          txChain.push({ tx: srcTx, txid: srcTxid });
-          break;
-        }
-        txChain.push({ tx: srcTx, txid: srcTxid });
-        curTx = srcTx;
-        curTxid = srcTxid;
-      }
-      const freshBeef = new Beef();
-      for (let i = txChain.length - 1; i >= 0; i--) freshBeef.mergeTransaction(txChain[i].tx);
-      const freshAtomicBytes = new Uint8Array(freshBeef.toBinaryAtomic(paymentTxid));
-      const wallet2 = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
-      await wallet2._setup.wallet.storage.internalizeAction({
-        tx: freshAtomicBytes,
-        outputs: [{ outputIndex: paymentOutputIndex, protocol: 'wallet payment', paymentRemittance: { derivationPrefix: derivPrefix, derivationSuffix: derivSuffix, senderIdentityKey: msg.from } }],
-        description: `Web research payment from ${msg.from.slice(0, 12)}...`,
-      });
-      await wallet2.destroy();
-      walletAccepted = true;
-      acceptError = null;
-    } catch (err2) {
-      acceptError = `Attempt 1: ${err1.message} | Attempt 2: ${err2.message}`;
-    }
-  }
+  const paymentTxid = payResult.txid;
+  const paymentSats = payResult.satoshis;
+  const walletAccepted = payResult.walletAccepted;
+  const acceptError = payResult.error;
 
   // ── Queue the research for Clawdbot to handle (uses built-in web_search) ──
   const queueEntry = {
@@ -2583,113 +2269,18 @@ async function processTranslate(msg, identityKey, privKey) {
     return reject('Text too long. Maximum 5000 characters.', 'text too long');
   }
 
-  // ── Payment verification ──
-  if (!payment || !payment.beef || !payment.satoshis) {
-    return reject(`No payment included. Translation costs ${PRICE} sats.`, 'no payment');
-  }
-  if (payment.satoshis < PRICE) {
-    return reject(`Insufficient payment: ${payment.satoshis} sats sent, ${PRICE} required.`, `underpaid: ${payment.satoshis} < ${PRICE}`);
-  }
-
-  // ── Validate BEEF ──
-  let beefBytes;
-  try { beefBytes = Uint8Array.from(atob(payment.beef), c => c.charCodeAt(0)); } catch { beefBytes = null; }
-  let paymentTx = null;
-  let isAtomicBeef = false;
-  if (beefBytes && beefBytes.length > 20) {
-    // Try AtomicBEEF first, then regular BEEF — empty catches are intentional as we try both formats
-    try { paymentTx = Transaction.fromAtomicBEEF(Array.from(beefBytes)); isAtomicBeef = true; } catch { /* expected if not AtomicBEEF */ }
-    if (!paymentTx) try { const b = Beef.fromBinary(Array.from(beefBytes)); paymentTx = b.txs?.find(t => t.tx)?.tx; } catch { /* expected if malformed */ }
-  }
-  if (!paymentTx) {
-    return reject('Invalid payment BEEF.', 'invalid BEEF');
+  // ── Payment verification via shared helper ──
+  const walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+  const ourHash160 = Hash.hash160(PrivateKey.fromHex(walletIdentity.rootKeyHex).toPublicKey().encode(true));
+  const payResult = await verifyAndAcceptPayment(payment, PRICE, msg.from, 'translate', ourHash160);
+  if (!payResult.accepted) {
+    return reject(`Payment rejected: ${payResult.error}. Translation costs ${PRICE} sats.`, payResult.error);
   }
 
-  // ── Find our output & accept payment ──
-  const identityPath = path.join(WALLET_DIR, 'wallet-identity.json');
-  let walletIdentity;
-  try {
-    walletIdentity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
-  } catch (parseErr) {
-    return reject(`Failed to load wallet identity: ${parseErr.message}`, 'wallet error');
-  }
-  const ourPrivKey = PrivateKey.fromHex(walletIdentity.rootKeyHex);
-  const ourPubKey = ourPrivKey.toPublicKey();
-  const ourHash160 = Hash.hash160(ourPubKey.encode(true));
-  const ourHash160Hex = Array.from(ourHash160).map(b => b.toString(16).padStart(2, '0')).join('');
-
-  let paymentOutputIndex = -1;
-  let paymentSats = 0;
-  for (let i = 0; i < paymentTx.outputs.length; i++) {
-    const scriptHex = paymentTx.outputs[i].lockingScript.toHex();
-    if (scriptHex.includes(ourHash160Hex)) { paymentOutputIndex = i; paymentSats = paymentTx.outputs[i].satoshis; break; }
-  }
-  if (paymentOutputIndex < 0 || paymentSats < PRICE) {
-    return reject(paymentOutputIndex < 0 ? 'No output paying our address.' : `Output pays ${paymentSats} sats, ${PRICE} required.`, paymentOutputIndex < 0 ? 'no output to us' : `underpaid output: ${paymentSats}`);
-  }
-
-  const paymentTxid = paymentTx.id('hex');
-
-  // Accept into wallet
-  let walletAccepted = false;
-  let acceptError = null;
-  const derivPrefix = Utils.toBase64(Array.from(new TextEncoder().encode('translate')));
-  const derivSuffix = Utils.toBase64(Array.from(new TextEncoder().encode(paymentTxid.slice(0, 16))));
-  const internalizeArgs = {
-    outputs: [{
-      outputIndex: paymentOutputIndex,
-      protocol: 'wallet payment',
-      paymentRemittance: { derivationPrefix: derivPrefix, derivationSuffix: derivSuffix, senderIdentityKey: msg.from },
-    }],
-    description: `Translation payment from ${msg.from.slice(0, 12)}...`,
-  };
-
-  try {
-    const wallet = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
-    const atomicBytes = isAtomicBeef ? new Uint8Array(beefBytes) : new Uint8Array(Beef.fromBinary(Array.from(beefBytes)).toBinaryAtomic(paymentTxid));
-    await wallet._setup.wallet.storage.internalizeAction({ tx: atomicBytes, ...internalizeArgs });
-    await wallet.destroy();
-    walletAccepted = true;
-  } catch (err1) {
-    // Fallback: rebuild from WoC
-    try {
-      const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
-      const txChain = [];
-      let curTx = paymentTx;
-      let curTxid = paymentTxid;
-      txChain.push({ tx: curTx, txid: curTxid });
-      for (let depth = 0; depth < 10; depth++) {
-        const srcTxid = curTx.inputs[0].sourceTXID;
-        const srcHexResp = await wocFetch(`/tx/${srcTxid}/hex`);
-        if (!srcHexResp.ok) throw new Error(`WoC ${srcHexResp.status}`);
-        const srcTx = Transaction.fromHex(await srcHexResp.text());
-        const srcInfoResp = await wocFetch(`/tx/${srcTxid}`);
-        if (!srcInfoResp.ok) throw new Error(`WoC ${srcInfoResp.status}`);
-        const srcInfo = await srcInfoResp.json();
-        if (srcInfo.confirmations > 0 && srcInfo.blockheight) {
-          const proofResp = await wocFetch(`/tx/${srcTxid}/proof/tsc`);
-          if (proofResp.ok) {
-            const pd = await proofResp.json();
-            if (Array.isArray(pd) && pd.length > 0) srcTx.merklePath = buildMerklePathFromTSC(srcTxid, pd[0].index, pd[0].nodes, srcInfo.blockheight);
-          }
-          txChain.push({ tx: srcTx, txid: srcTxid });
-          break;
-        }
-        txChain.push({ tx: srcTx, txid: srcTxid });
-        curTx = srcTx;
-        curTxid = srcTxid;
-      }
-      const freshBeef = new Beef();
-      for (let i = txChain.length - 1; i >= 0; i--) freshBeef.mergeTransaction(txChain[i].tx);
-      const freshAtomicBytes = new Uint8Array(freshBeef.toBinaryAtomic(paymentTxid));
-      const wallet2 = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
-      await wallet2._setup.wallet.storage.internalizeAction({ tx: freshAtomicBytes, ...internalizeArgs });
-      await wallet2.destroy();
-      walletAccepted = true;
-    } catch (err2) {
-      acceptError = `Attempt 1: ${err1.message} | Attempt 2: ${err2.message}`;
-    }
-  }
+  const paymentTxid = payResult.txid;
+  const paymentSats = payResult.satoshis;
+  const walletAccepted = payResult.walletAccepted;
+  const acceptError = payResult.error;
 
   // ── Perform the translation using LibreTranslate or MyMemory API ──
   let translationResult;
@@ -2895,115 +2486,18 @@ async function processApiProxy(msg, identityKey, privKey) {
     return reject(`Unsupported API: ${api}. Supported: ${SUPPORTED_APIS.join(', ')}`, `unsupported api: ${api}`);
   }
 
-  // ── Payment verification ──
-  if (!payment || !payment.beef || !payment.satoshis) {
-    return reject(`No payment included. API proxy costs ${PRICE} sats.`, 'no payment');
-  }
-  if (payment.satoshis < PRICE) {
-    return reject(`Insufficient payment: ${payment.satoshis} sats sent, ${PRICE} required.`, `underpaid: ${payment.satoshis} < ${PRICE}`);
-  }
-
-  // ── Validate BEEF ──
-  let beefBytes;
-  try { beefBytes = Uint8Array.from(atob(payment.beef), c => c.charCodeAt(0)); } catch { beefBytes = null; }
-  let paymentTx = null;
-  let isAtomicBeef = false;
-  if (beefBytes && beefBytes.length > 20) {
-    // Try AtomicBEEF first, then regular BEEF — empty catches are intentional as we try both formats
-    try { paymentTx = Transaction.fromAtomicBEEF(Array.from(beefBytes)); isAtomicBeef = true; } catch { /* expected if not AtomicBEEF */ }
-    if (!paymentTx) try { const b = Beef.fromBinary(Array.from(beefBytes)); paymentTx = b.txs?.find(t => t.tx)?.tx; } catch { /* expected if malformed */ }
-  }
-  if (!paymentTx) {
-    return reject('Invalid payment BEEF.', 'invalid BEEF');
+  // ── Payment verification via shared helper ──
+  const walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+  const ourHash160 = Hash.hash160(PrivateKey.fromHex(walletIdentity.rootKeyHex).toPublicKey().encode(true));
+  const payResult = await verifyAndAcceptPayment(payment, PRICE, msg.from, 'api-proxy', ourHash160);
+  if (!payResult.accepted) {
+    return reject(`Payment rejected: ${payResult.error}. API proxy costs ${PRICE} sats.`, payResult.error);
   }
 
-  // ── Find our output & accept payment ──
-  const walletIdentityPath = path.join(WALLET_DIR, 'wallet-identity.json');
-  let walletIdentity;
-  try {
-    walletIdentity = JSON.parse(fs.readFileSync(walletIdentityPath, 'utf-8'));
-  } catch (parseErr) {
-    return reject(`Failed to load wallet identity: ${parseErr.message}`, 'wallet error');
-  }
-  const ourPrivKey = PrivateKey.fromHex(walletIdentity.rootKeyHex);
-  const ourPubKey = ourPrivKey.toPublicKey();
-  const ourHash160 = Hash.hash160(ourPubKey.encode(true));
-  const ourHash160Hex = Array.from(ourHash160).map(b => b.toString(16).padStart(2, '0')).join('');
-
-  let paymentOutputIndex = -1;
-  let paymentSats = 0;
-  for (let i = 0; i < paymentTx.outputs.length; i++) {
-    const scriptHex = paymentTx.outputs[i].lockingScript.toHex();
-    if (scriptHex.includes(ourHash160Hex)) { paymentOutputIndex = i; paymentSats = paymentTx.outputs[i].satoshis; break; }
-  }
-  if (paymentOutputIndex < 0) {
-    return reject('No output paying our address.', 'no output to us');
-  }
-  if (paymentSats < PRICE) {
-    return reject(`Output pays ${paymentSats} sats, ${PRICE} required.`, `underpaid output: ${paymentSats}`);
-  }
-
-  const paymentTxid = paymentTx.id('hex');
-
-  // Accept into wallet
-  let walletAccepted = false;
-  let acceptError = null;
-  const derivPrefix = Utils.toBase64(Array.from(new TextEncoder().encode('api-proxy')));
-  const derivSuffix = Utils.toBase64(Array.from(new TextEncoder().encode(paymentTxid.slice(0, 16))));
-  const internalizeArgs = {
-    outputs: [{
-      outputIndex: paymentOutputIndex,
-      protocol: 'wallet payment',
-      paymentRemittance: { derivationPrefix: derivPrefix, derivationSuffix: derivSuffix, senderIdentityKey: msg.from },
-    }],
-    description: `API proxy payment from ${msg.from.slice(0, 12)}...`,
-  };
-
-  try {
-    const wallet = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
-    const atomicBytes = isAtomicBeef ? new Uint8Array(beefBytes) : new Uint8Array(Beef.fromBinary(Array.from(beefBytes)).toBinaryAtomic(paymentTxid));
-    await wallet._setup.wallet.storage.internalizeAction({ tx: atomicBytes, ...internalizeArgs });
-    await wallet.destroy();
-    walletAccepted = true;
-  } catch (err1) {
-    // Fallback: rebuild from WoC
-    try {
-      const txChain = [];
-      let curTx = paymentTx;
-      let curTxid = paymentTxid;
-      txChain.push({ tx: curTx, txid: curTxid });
-      for (let depth = 0; depth < 10; depth++) {
-        const srcTxid = curTx.inputs[0].sourceTXID;
-        const srcHexResp = await wocFetch(`/tx/${srcTxid}/hex`);
-        if (!srcHexResp.ok) throw new Error(`WoC ${srcHexResp.status}`);
-        const srcTx = Transaction.fromHex(await srcHexResp.text());
-        const srcInfoResp = await wocFetch(`/tx/${srcTxid}`);
-        if (!srcInfoResp.ok) throw new Error(`WoC ${srcInfoResp.status}`);
-        const srcInfo = await srcInfoResp.json();
-        if (srcInfo.confirmations > 0 && srcInfo.blockheight) {
-          const proofResp = await wocFetch(`/tx/${srcTxid}/proof/tsc`);
-          if (proofResp.ok) {
-            const pd = await proofResp.json();
-            if (Array.isArray(pd) && pd.length > 0) srcTx.merklePath = buildMerklePathFromTSC(srcTxid, pd[0].index, pd[0].nodes, srcInfo.blockheight);
-          }
-          txChain.push({ tx: srcTx, txid: srcTxid });
-          break;
-        }
-        txChain.push({ tx: srcTx, txid: srcTxid });
-        curTx = srcTx;
-        curTxid = srcTxid;
-      }
-      const freshBeef = new Beef();
-      for (let i = txChain.length - 1; i >= 0; i--) freshBeef.mergeTransaction(txChain[i].tx);
-      const freshAtomicBytes = new Uint8Array(freshBeef.toBinaryAtomic(paymentTxid));
-      const wallet2 = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
-      await wallet2._setup.wallet.storage.internalizeAction({ tx: freshAtomicBytes, ...internalizeArgs });
-      await wallet2.destroy();
-      walletAccepted = true;
-    } catch (err2) {
-      acceptError = `Attempt 1: ${err1.message} | Attempt 2: ${err2.message}`;
-    }
-  }
+  const paymentTxid = payResult.txid;
+  const paymentSats = payResult.satoshis;
+  const walletAccepted = payResult.walletAccepted;
+  const acceptError = payResult.error;
 
   // ── Execute the API proxy request ──
   let apiResult;
@@ -3360,118 +2854,23 @@ async function processRoulette(msg, identityKey, privKey) {
     );
   }
 
-  // ── Payment verification ──
-  if (!payment || !payment.beef || !payment.satoshis) {
-    return reject(`No payment included. Place your bet (${ROULETTE_MIN_BET}-${ROULETTE_MAX_BET} sats) as the payment amount.`, 'no payment');
-  }
-  if (betAmount < ROULETTE_MIN_BET) {
-    return reject(`Minimum bet is ${ROULETTE_MIN_BET} sats. You sent ${betAmount}.`, `bet too low: ${betAmount}`);
-  }
+  // ── Payment verification via shared helper ──
   if (betAmount > ROULETTE_MAX_BET) {
     return reject(`Maximum bet is ${ROULETTE_MAX_BET} sats. You sent ${betAmount}.`, `bet too high: ${betAmount}`);
   }
 
-  // ── Validate BEEF ──
-  let beefBytes;
-  try { beefBytes = Uint8Array.from(atob(payment.beef), c => c.charCodeAt(0)); } catch { beefBytes = null; }
-  let paymentTx = null;
-  let isAtomicBeef = false;
-  if (beefBytes && beefBytes.length > 20) {
-    try { paymentTx = Transaction.fromAtomicBEEF(Array.from(beefBytes)); isAtomicBeef = true; } catch { /* expected */ }
-    if (!paymentTx) try { const b = Beef.fromBinary(Array.from(beefBytes)); paymentTx = b.txs?.find(t => t.tx)?.tx; } catch { /* expected */ }
-  }
-  if (!paymentTx) {
-    return reject('Invalid payment BEEF.', 'invalid BEEF');
+  const walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+  const ourHash160 = Hash.hash160(PrivateKey.fromHex(walletIdentity.rootKeyHex).toPublicKey().encode(true));
+  const payResult = await verifyAndAcceptPayment(payment, ROULETTE_MIN_BET, msg.from, 'roulette', ourHash160);
+  if (!payResult.accepted) {
+    return reject(`Payment rejected: ${payResult.error}. Place your bet (${ROULETTE_MIN_BET}-${ROULETTE_MAX_BET} sats).`, payResult.error);
   }
 
-  // ── Find our output & accept payment ──
-  const walletIdentityPath = path.join(WALLET_DIR, 'wallet-identity.json');
-  let walletIdentity;
-  try {
-    walletIdentity = JSON.parse(fs.readFileSync(walletIdentityPath, 'utf-8'));
-  } catch (parseErr) {
-    return reject(`Failed to load wallet identity: ${parseErr.message}`, 'wallet error');
-  }
-  const ourPrivKey = PrivateKey.fromHex(walletIdentity.rootKeyHex);
-  const ourPubKey = ourPrivKey.toPublicKey();
-  const ourHash160 = Hash.hash160(ourPubKey.encode(true));
-  const ourHash160Hex = Array.from(ourHash160).map(b => b.toString(16).padStart(2, '0')).join('');
-
-  let paymentOutputIndex = -1;
-  let paymentSats = 0;
-  for (let i = 0; i < paymentTx.outputs.length; i++) {
-    const scriptHex = paymentTx.outputs[i].lockingScript.toHex();
-    if (scriptHex.includes(ourHash160Hex)) { paymentOutputIndex = i; paymentSats = paymentTx.outputs[i].satoshis; break; }
-  }
-  if (paymentOutputIndex < 0) {
-    return reject('No output paying our address.', 'no output to us');
-  }
-  if (paymentSats < ROULETTE_MIN_BET) {
-    return reject(`Output pays ${paymentSats} sats, minimum ${ROULETTE_MIN_BET} required.`, `underpaid: ${paymentSats}`);
-  }
-
-  const paymentTxid = paymentTx.id('hex');
+  const paymentTxid = payResult.txid;
+  const paymentSats = payResult.satoshis;
+  const walletAccepted = payResult.walletAccepted;
+  const acceptError = payResult.error;
   const actualBetAmount = Math.min(paymentSats, ROULETTE_MAX_BET);
-
-  // Accept into wallet
-  let walletAccepted = false;
-  let acceptError = null;
-  const derivPrefix = Utils.toBase64(Array.from(new TextEncoder().encode('roulette')));
-  const derivSuffix = Utils.toBase64(Array.from(new TextEncoder().encode(paymentTxid.slice(0, 16))));
-  const internalizeArgs = {
-    outputs: [{
-      outputIndex: paymentOutputIndex,
-      protocol: 'wallet payment',
-      paymentRemittance: { derivationPrefix: derivPrefix, derivationSuffix: derivSuffix, senderIdentityKey: msg.from },
-    }],
-    description: `Roulette bet from ${msg.from.slice(0, 12)}...`,
-  };
-
-  try {
-    const wallet = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
-    const atomicBytes = isAtomicBeef ? new Uint8Array(beefBytes) : new Uint8Array(Beef.fromBinary(Array.from(beefBytes)).toBinaryAtomic(paymentTxid));
-    await wallet._setup.wallet.storage.internalizeAction({ tx: atomicBytes, ...internalizeArgs });
-    await wallet.destroy();
-    walletAccepted = true;
-  } catch (err1) {
-    // Fallback: rebuild from WoC
-    try {
-      const txChain = [];
-      let curTx = paymentTx;
-      let curTxid = paymentTxid;
-      txChain.push({ tx: curTx, txid: curTxid });
-      for (let depth = 0; depth < 10; depth++) {
-        const srcTxid = curTx.inputs[0].sourceTXID;
-        const srcHexResp = await wocFetch(`/tx/${srcTxid}/hex`);
-        if (!srcHexResp.ok) throw new Error(`WoC ${srcHexResp.status}`);
-        const srcTx = Transaction.fromHex(await srcHexResp.text());
-        const srcInfoResp = await wocFetch(`/tx/${srcTxid}`);
-        if (!srcInfoResp.ok) throw new Error(`WoC ${srcInfoResp.status}`);
-        const srcInfo = await srcInfoResp.json();
-        if (srcInfo.confirmations > 0 && srcInfo.blockheight) {
-          const proofResp = await wocFetch(`/tx/${srcTxid}/proof/tsc`);
-          if (proofResp.ok) {
-            const pd = await proofResp.json();
-            if (Array.isArray(pd) && pd.length > 0) srcTx.merklePath = buildMerklePathFromTSC(srcTxid, pd[0].index, pd[0].nodes, srcInfo.blockheight);
-          }
-          txChain.push({ tx: srcTx, txid: srcTxid });
-          break;
-        }
-        txChain.push({ tx: srcTx, txid: srcTxid });
-        curTx = srcTx;
-        curTxid = srcTxid;
-      }
-      const freshBeef = new Beef();
-      for (let i = txChain.length - 1; i >= 0; i--) freshBeef.mergeTransaction(txChain[i].tx);
-      const freshAtomicBytes = new Uint8Array(freshBeef.toBinaryAtomic(paymentTxid));
-      const wallet2 = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
-      await wallet2._setup.wallet.storage.internalizeAction({ tx: freshAtomicBytes, ...internalizeArgs });
-      await wallet2.destroy();
-      walletAccepted = true;
-    } catch (err2) {
-      acceptError = `Attempt 1: ${err1.message} | Attempt 2: ${err2.message}`;
-    }
-  }
 
   // ── SPIN THE WHEEL ──
   const spinResult = spinRouletteWheel();
@@ -3845,7 +3244,7 @@ function analyzeCodeSnippet(code, language) {
 
 /** Handle a tell-joke service request with payment verification. */
 async function processJokeRequest(msg, identityKey, privKey) {
-  const payment = msg.payload?.payment;
+  const PRICE = 5;
 
   // Helper to send rejection
   async function reject(reason, shortReason) {
@@ -3867,152 +3266,18 @@ async function processJokeRequest(msg, identityKey, privKey) {
     };
   }
 
-  if (!payment || !payment.beef || !payment.satoshis) {
-    return reject('No payment included. This service costs 5 sats.', 'no payment');
-  }
-  if (payment.satoshis < 5) {
-    return reject(
-      `Insufficient payment: ${payment.satoshis} sats sent, 5 required.`,
-      `underpaid: ${payment.satoshis} < 5`,
-    );
+  // ── Payment verification via shared helper ──
+  const walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+  const ourHash160 = Hash.hash160(PrivateKey.fromHex(walletIdentity.rootKeyHex).toPublicKey().encode(true));
+  const payResult = await verifyAndAcceptPayment(msg.payload?.payment, PRICE, msg.from, 'tell-joke', ourHash160);
+  if (!payResult.accepted) {
+    return reject(`Payment rejected: ${payResult.error}. This service costs ${PRICE} sats.`, payResult.error);
   }
 
-  // Decode BEEF
-  let beefBytes;
-  try {
-    beefBytes = Uint8Array.from(atob(payment.beef), c => c.charCodeAt(0));
-  } catch { beefBytes = null; }
-
-  if (!beefBytes || beefBytes.length < 20) {
-    return reject('Invalid payment BEEF. Could not decode base64.', 'invalid base64');
-  }
-
-  // Parse the payment transaction
-  let paymentTx = null;
-  let isAtomicBeef = false;
-  try { paymentTx = Transaction.fromAtomicBEEF(Array.from(beefBytes)); isAtomicBeef = true; } catch {}
-  if (!paymentTx) {
-    try {
-      const beefObj = Beef.fromBinary(Array.from(beefBytes));
-      const txs = beefObj.txs || [];
-      const newest = txs.find(t => t.tx) || txs[txs.length - 1];
-      paymentTx = newest?.tx || null;
-    } catch {}
-  }
-  if (!paymentTx) {
-    return reject('Invalid payment BEEF. Could not parse transaction.', 'unparseable BEEF');
-  }
-
-  // Find the output that pays us
-  const identityPath = path.join(WALLET_DIR, 'wallet-identity.json');
-  const walletIdentity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
-  const ourPrivKey = PrivateKey.fromHex(walletIdentity.rootKeyHex);
-  const ourPubKey = ourPrivKey.toPublicKey();
-  const ourHash160 = Hash.hash160(ourPubKey.encode(true));
-  const ourHash160Hex = Array.from(ourHash160).map(b => b.toString(16).padStart(2, '0')).join('');
-
-  let paymentOutputIndex = -1;
-  let paymentSats = 0;
-  for (let i = 0; i < paymentTx.outputs.length; i++) {
-    const scriptHex = paymentTx.outputs[i].lockingScript.toHex();
-    if (scriptHex.includes(ourHash160Hex)) {
-      paymentOutputIndex = i;
-      paymentSats = paymentTx.outputs[i].satoshis;
-      break;
-    }
-  }
-  if (paymentOutputIndex < 0) {
-    return reject('No output paying our address found in the transaction.', 'no output to us');
-  }
-  if (paymentSats < 5) {
-    return reject(`Output pays ${paymentSats} sats, minimum 5 required.`, `underpaid: ${paymentSats}`);
-  }
-
-  // Accept the payment into our wallet
-  const paymentTxid = paymentTx.id('hex');
-  let walletAccepted = false;
-  let acceptError = null;
-
-  const derivPrefix = payment.derivationPrefix || Utils.toBase64(Array.from(new TextEncoder().encode('service-payment')));
-  const derivSuffix = payment.derivationSuffix || Utils.toBase64(Array.from(new TextEncoder().encode(paymentTxid.slice(0, 16))));
-  const internalizeArgs = {
-    outputs: [{
-      outputIndex: paymentOutputIndex,
-      protocol: 'wallet payment',
-      paymentRemittance: {
-        derivationPrefix: derivPrefix, derivationSuffix: derivSuffix,
-        senderIdentityKey: msg.from,
-      },
-    }],
-    description: `Payment for tell-joke from ${msg.from.slice(0, 12)}...`,
-  };
-
-  // Attempt 1: use the BEEF bytes directly from sender
-  try {
-    const wallet = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
-    let atomicBytes;
-    if (isAtomicBeef) {
-      atomicBytes = new Uint8Array(beefBytes);
-    } else {
-      const beefObj = Beef.fromBinary(Array.from(beefBytes));
-      atomicBytes = beefObj.toBinaryAtomic(paymentTxid);
-    }
-    await wallet._setup.wallet.storage.internalizeAction({ tx: atomicBytes, ...internalizeArgs });
-    await wallet.destroy();
-    walletAccepted = true;
-  } catch (err1) {
-    // Attempt 2: rebuild BEEF from WhatsonChain
-    try {
-      const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
-      const wocBase = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
-      const txChain = [];
-      let curTxid = paymentTxid;
-      let curTx = paymentTx;
-      txChain.push({ tx: curTx, txid: curTxid });
-
-      for (let depth = 0; depth < 10; depth++) {
-        const srcTxid = curTx.inputs[0].sourceTXID;
-        const srcHexResp = await wocFetch(`/tx/${srcTxid}/hex`);
-        if (!srcHexResp.ok) throw new Error(`WoC tx hex ${srcTxid.slice(0,12)}: ${srcHexResp.status}`);
-        const srcHex = await srcHexResp.text();
-        const srcTx = Transaction.fromHex(srcHex);
-
-        const srcInfoResp = await wocFetch(`/tx/${srcTxid}`);
-        if (!srcInfoResp.ok) throw new Error(`WoC tx info ${srcTxid.slice(0,12)}: ${srcInfoResp.status}`);
-        const srcInfo = await srcInfoResp.json();
-
-        if (srcInfo.confirmations > 0 && srcInfo.blockheight) {
-          const proofResp = await wocFetch(`/tx/${srcTxid}/proof/tsc`);
-          if (proofResp.ok) {
-            const proofData = await proofResp.json();
-            if (Array.isArray(proofData) && proofData.length > 0) {
-              const proof = proofData[0];
-              srcTx.merklePath = buildMerklePathFromTSC(srcTxid, proof.index, proof.nodes, srcInfo.blockheight);
-            }
-          }
-          txChain.push({ tx: srcTx, txid: srcTxid });
-          break;
-        }
-        txChain.push({ tx: srcTx, txid: srcTxid });
-        curTx = srcTx;
-        curTxid = srcTxid;
-      }
-
-      const freshBeef = new Beef();
-      for (let i = txChain.length - 1; i >= 0; i--) {
-        freshBeef.mergeTransaction(txChain[i].tx);
-      }
-      const freshAtomicBytes = new Uint8Array(freshBeef.toBinaryAtomic(paymentTxid));
-
-      const wallet2 = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
-      await wallet2._setup.wallet.storage.internalizeAction({ tx: freshAtomicBytes, ...internalizeArgs });
-      await wallet2.destroy();
-      walletAccepted = true;
-      acceptError = null;
-    } catch (err2) {
-      acceptError = `Attempt 1: ${err1 instanceof Error ? err1.message : String(err1)} | Attempt 2: ${err2 instanceof Error ? err2.message : String(err2)}`;
-    }
-  }
+  const paymentTxid = payResult.txid;
+  const paymentSats = payResult.satoshis;
+  const walletAccepted = payResult.walletAccepted;
+  const acceptError = payResult.error;
 
   // Serve the joke
   const joke = JOKES[Math.floor(Math.random() * JOKES.length)];
