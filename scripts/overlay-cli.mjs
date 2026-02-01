@@ -1182,44 +1182,62 @@ async function buildDirectPayment(recipientPubKey, sats, desc) {
   const recipientPubKeyBytes = recipientPubKeyObj.encode(true);
   const recipientHash160 = Hash.hash160(recipientPubKeyBytes);
 
-  // Fetch UTXOs from WhatsonChain
-  const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
-  const wocBase = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
+  // ── BEEF-first: use stored change output (no WoC calls) ──
+  const beefStorePath = path.join(OVERLAY_STATE_DIR, 'latest-change.json');
+  let sourceTx = null;
+  let sourceVout = -1;
+  let sourceValue = 0;
 
-  const utxoResp = await wocFetch(`/address/${senderAddress}/unspent`);
-  if (!utxoResp.ok) throw new Error(`Failed to fetch UTXOs: ${utxoResp.status}`);
-  const allUtxos = await utxoResp.json();
-
-  // Filter for usable UTXOs (need enough for payment + fee)
-  const minRequired = sats + 200; // payment + estimated fee
-  const utxos = allUtxos.filter(u => u.value >= minRequired);
-  if (utxos.length === 0) {
-    const totalAvailable = allUtxos.reduce((sum, u) => sum + u.value, 0);
-    throw new Error(`Insufficient funds. Need ${minRequired} sats, have ${totalAvailable} sats available.`);
-  }
-
-  const utxo = utxos[0]; // Use first sufficient UTXO
-
-  // Fetch source transaction
-  const rawResp = await wocFetch(`/tx/${utxo.tx_hash}/hex`);
-  if (!rawResp.ok) throw new Error(`Failed to fetch source tx: ${rawResp.status}`);
-  const rawTxHex = await rawResp.text();
-  const sourceTx = Transaction.fromHex(rawTxHex);
-
-  // Fetch merkle proof for source tx
-  const txInfoResp = await wocFetch(`/tx/${utxo.tx_hash}`);
-  const txInfo = await txInfoResp.json();
-  const blockHeight = txInfo.blockheight;
-
-  if (blockHeight && txInfo.confirmations > 0) {
-    const proofResp = await wocFetch(`/tx/${utxo.tx_hash}/proof/tsc`);
-    if (proofResp.ok) {
-      const proofData = await proofResp.json();
-      if (Array.isArray(proofData) && proofData.length > 0) {
-        const proof = proofData[0];
-        const mpPath = buildMerklePathFromTSC(utxo.tx_hash, proof.index, proof.nodes, blockHeight);
-        sourceTx.merklePath = mpPath;
+  // Try stored BEEF first
+  try {
+    if (fs.existsSync(beefStorePath)) {
+      const stored = JSON.parse(fs.readFileSync(beefStorePath, 'utf-8'));
+      if (stored.satoshis >= sats + 200) {
+        sourceTx = reconstructFromChain(stored);
+        sourceVout = stored.vout;
+        sourceValue = stored.satoshis;
       }
+    }
+  } catch {}
+
+  // Fallback to WoC if no stored BEEF
+  if (!sourceTx) {
+    const utxoResp = await wocFetch(`/address/${senderAddress}/unspent`);
+    if (!utxoResp.ok) throw new Error(`Failed to fetch UTXOs: ${utxoResp.status}`);
+    const allUtxos = await utxoResp.json();
+    const utxos = allUtxos.filter(u => u.value >= sats + 200);
+    if (utxos.length === 0) throw new Error(`Insufficient funds. Need ${sats + 200} sats.`);
+    const utxo = utxos[0];
+
+    const rawResp = await wocFetch(`/tx/${utxo.tx_hash}/hex`);
+    if (!rawResp.ok) throw new Error(`Failed to fetch source tx: ${rawResp.status}`);
+    sourceTx = Transaction.fromHex(await rawResp.text());
+    sourceVout = utxo.tx_pos;
+    sourceValue = utxo.value;
+
+    // Walk back for merkle proof
+    let curTx = sourceTx; let curTxid = utxo.tx_hash;
+    for (let depth = 0; depth < 10; depth++) {
+      const infoResp = await wocFetch(`/tx/${curTxid}`);
+      if (!infoResp.ok) break;
+      const info = await infoResp.json();
+      if (info.confirmations > 0 && info.blockheight) {
+        const proofResp = await wocFetch(`/tx/${curTxid}/proof/tsc`);
+        if (proofResp.ok) {
+          const pd = await proofResp.json();
+          if (Array.isArray(pd) && pd.length > 0) {
+            curTx.merklePath = buildMerklePathFromTSC(curTxid, pd[0].index, pd[0].nodes, info.blockheight);
+          }
+        }
+        break;
+      }
+      const parentTxid = curTx.inputs[0]?.sourceTXID;
+      if (!parentTxid) break;
+      const parentResp = await wocFetch(`/tx/${parentTxid}/hex`);
+      if (!parentResp.ok) break;
+      const parentTx = Transaction.fromHex(await parentResp.text());
+      curTx.inputs[0].sourceTransaction = parentTx;
+      curTx = parentTx; curTxid = parentTxid;
     }
   }
 
@@ -1231,7 +1249,7 @@ async function buildDirectPayment(recipientPubKey, sats, desc) {
   const tx = new Transaction();
   tx.addInput({
     sourceTransaction: sourceTx,
-    sourceOutputIndex: utxo.tx_pos,
+    sourceOutputIndex: sourceVout,
     unlockingScriptTemplate: new P2PKH().unlock(privKey),
     sequence: 0xffffffff,
   });
@@ -1245,10 +1263,10 @@ async function buildDirectPayment(recipientPubKey, sats, desc) {
   // Calculate fee and change
   const estimatedSize = 148 + 34 * 2 + 10; // 1 input, 2 outputs
   const fee = Math.max(Math.ceil(estimatedSize * 0.5), 50); // 0.5 sat/byte min
-  const change = utxo.value - sats - fee;
+  const change = sourceValue - sats - fee;
 
   if (change < 0) {
-    throw new Error(`Insufficient funds after fee. UTXO: ${utxo.value}, payment: ${sats}, fee: ${fee}`);
+    throw new Error(`Insufficient funds after fee. Source: ${sourceValue}, payment: ${sats}, fee: ${fee}`);
   }
 
   // Output 1: Change back to sender (if dust threshold met)
@@ -1261,25 +1279,31 @@ async function buildDirectPayment(recipientPubKey, sats, desc) {
 
   await tx.sign();
 
-  // Build BEEF
+  // Build BEEF — auto-follows source chain
   const beef = new Beef();
-  beef.mergeTransaction(sourceTx);
   beef.mergeTransaction(tx);
 
   const txid = tx.id('hex');
   const atomicBeefBytes = beef.toBinaryAtomic(txid);
   const beefBase64 = Utils.toBase64(Array.from(atomicBeefBytes));
 
-  // Broadcast the transaction
-  const broadcastResp = await wocFetch(`/tx/raw`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ txhex: tx.toHex() }),
-  });
+  // Save change BEEF for next tx (instant chaining)
+  if (change >= 136) {
+    saveChangeBeef(tx, change, 1);
+  }
 
-  if (!broadcastResp.ok) {
-    const errText = await broadcastResp.text();
-    throw new Error(`Broadcast failed: ${broadcastResp.status} — ${errText}`);
+  // Broadcast (best-effort, not required for BEEF-based delivery)
+  try {
+    const broadcastResp = await wocFetch(`/tx/raw`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ txhex: tx.toHex() }),
+    });
+    if (!broadcastResp.ok) {
+      console.error(`[broadcast] Non-fatal: ${broadcastResp.status}`);
+    }
+  } catch (bcastErr) {
+    console.error(`[broadcast] Non-fatal: ${bcastErr.message}`);
   }
 
   const explorerBase = NETWORK === 'mainnet' ? 'https://whatsonchain.com' : 'https://test.whatsonchain.com';
