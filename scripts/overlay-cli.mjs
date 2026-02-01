@@ -3210,7 +3210,11 @@ function loadMemoryStore() {
 }
 
 function saveMemoryStore(store) {
-  fs.writeFileSync(MEMORY_STORE_PATH, JSON.stringify(store, null, 2));
+  try {
+    fs.writeFileSync(MEMORY_STORE_PATH, JSON.stringify(store, null, 2));
+  } catch (err) {
+    throw new Error(`Failed to save memory store: ${err.message}`);
+  }
 }
 
 async function processMemoryStore(msg, identityKey, privKey) {
@@ -3259,7 +3263,12 @@ async function processMemoryStore(msg, identityKey, privKey) {
   }
 
   // ── Payment verification ──
-  const walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+  let walletIdentity;
+  try {
+    walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+  } catch (err) {
+    return reject(`Wallet identity not found or corrupted: ${err.message}`, 'wallet error');
+  }
   const ourHash160 = Hash.hash160(PrivateKey.fromHex(walletIdentity.rootKeyHex).toPublicKey().encode(true));
   const payResult = await verifyAndAcceptPayment(payment, MEMORY_STORE_PRICE, msg.from, 'memory-store', ourHash160);
   if (!payResult.accepted) {
