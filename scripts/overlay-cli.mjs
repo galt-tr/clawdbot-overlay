@@ -128,14 +128,41 @@ const WOC_API_KEY = process.env.WOC_API_KEY || '';
 const OVERLAY_STATE_DIR = path.join(os.homedir(), '.clawdbot', 'bsv-overlay');
 const PROTOCOL_ID = 'clawdbot-overlay-v1';
 
-/** Fetch from WhatsonChain with optional API key auth */
-function wocFetch(urlPath, options = {}) {
+/** 
+ * Fetch from WhatsonChain with optional API key auth and retry logic.
+ * Retries on 429 (rate limit) and 5xx errors with exponential backoff.
+ */
+async function wocFetch(urlPath, options = {}, maxRetries = 3) {
   const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
   const base = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
   const url = urlPath.startsWith('http') ? urlPath : `${base}${urlPath}`;
   const headers = { ...(options.headers || {}) };
   if (WOC_API_KEY) headers['Authorization'] = `Bearer ${WOC_API_KEY}`;
-  return fetch(url, { ...options, headers });
+  
+  let lastError;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const resp = await fetch(url, { ...options, headers });
+      
+      // Retry on 429 (rate limit) or 5xx (server error)
+      if ((resp.status === 429 || resp.status >= 500) && attempt < maxRetries) {
+        const delayMs = Math.min(1000 * Math.pow(2, attempt), 8000); // 1s, 2s, 4s, 8s max
+        await new Promise(r => setTimeout(r, delayMs));
+        continue;
+      }
+      
+      return resp;
+    } catch (err) {
+      lastError = err;
+      if (attempt < maxRetries) {
+        const delayMs = Math.min(1000 * Math.pow(2, attempt), 8000);
+        await new Promise(r => setTimeout(r, delayMs));
+        continue;
+      }
+    }
+  }
+  
+  throw lastError || new Error('WoC fetch failed after retries');
 }
 const TOPICS = { IDENTITY: 'tm_clawdbot_identity', SERVICES: 'tm_clawdbot_services' };
 const LOOKUP_SERVICES = { AGENTS: 'ls_clawdbot_agents', SERVICES: 'ls_clawdbot_services' };
