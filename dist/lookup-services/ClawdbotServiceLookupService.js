@@ -85,6 +85,13 @@ export class ClawdbotServiceLookupService {
         const data = this.parseServiceFromScript(lockingScript);
         if (!data)
             return;
+        // Handle service-delete tombstone: remove existing record and return
+        if (data.type === 'service-delete') {
+            await this.knex(SERVICES_TABLE)
+                .where({ identityKey: data.identityKey, serviceId: data.serviceId })
+                .delete();
+            return;
+        }
         // Dedup: remove old entries for the same (identityKey, serviceId)
         // so re-advertising replaces the previous listing
         await this.knex(SERVICES_TABLE)
@@ -240,7 +247,7 @@ matching service catalog UTXOs.
             return null;
         try {
             const payload = JSON.parse(new TextDecoder().decode(pushes[1]));
-            if (payload.type !== 'service')
+            if (payload.type !== 'service' && payload.type !== 'service-delete')
                 return null;
             return payload;
         }

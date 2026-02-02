@@ -115,10 +115,16 @@ export class ClawdbotIdentityTopicManager {
             // Validate required fields
             if (payload.protocol !== PROTOCOL_ID)
                 return null;
-            if (payload.type !== 'identity')
+            if (payload.type !== 'identity' && payload.type !== 'identity-delete')
                 return null;
             if (typeof payload.identityKey !== 'string' || !/^[0-9a-fA-F]{66}$/.test(payload.identityKey))
                 return null;
+            // Delete tombstones only need identityKey and timestamp
+            if (payload.type === 'identity-delete') {
+                if (typeof payload.timestamp !== 'string')
+                    return null;
+                return payload;
+            }
             if (typeof payload.name !== 'string' || payload.name.length === 0)
                 return null;
             if (!Array.isArray(payload.capabilities))

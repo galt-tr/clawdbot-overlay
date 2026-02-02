@@ -106,10 +106,18 @@ export class ClawdbotServicesTopicManager {
             // Validate required fields
             if (payload.protocol !== PROTOCOL_ID)
                 return null;
-            if (payload.type !== 'service')
+            if (payload.type !== 'service' && payload.type !== 'service-delete')
                 return null;
             if (typeof payload.identityKey !== 'string' || !/^[0-9a-fA-F]{66}$/.test(payload.identityKey))
                 return null;
+            // Delete tombstones only need identityKey, serviceId, and timestamp
+            if (payload.type === 'service-delete') {
+                if (typeof payload.serviceId !== 'string' || payload.serviceId.length === 0)
+                    return null;
+                if (typeof payload.timestamp !== 'string')
+                    return null;
+                return payload;
+            }
             if (typeof payload.serviceId !== 'string' || payload.serviceId.length === 0)
                 return null;
             if (typeof payload.name !== 'string' || payload.name.length === 0)

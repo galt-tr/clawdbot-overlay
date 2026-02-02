@@ -84,7 +84,18 @@ export class ClawdbotAgentLookupService {
         const data = this.parseIdentityFromScript(lockingScript);
         if (!data)
             return;
-        // Upsert: if this agent already has a record, replace it
+        // Handle identity-delete tombstone: remove existing record and return
+        if (data.type === 'identity-delete') {
+            await this.knex(AGENTS_TABLE)
+                .where({ identityKey: data.identityKey })
+                .delete();
+            return;
+        }
+        // Upsert: remove any existing record for the same identityKey first, then insert
+        await this.knex(AGENTS_TABLE)
+            .where({ identityKey: data.identityKey })
+            .andWhereNot({ txid, outputIndex })
+            .delete();
         await this.knex(AGENTS_TABLE)
             .insert({
             txid,
@@ -242,7 +253,7 @@ BEEF-formatted transactions for the caller.
             return null;
         try {
             const payload = JSON.parse(new TextDecoder().decode(pushes[1]));
-            if (payload.type !== 'identity')
+            if (payload.type !== 'identity' && payload.type !== 'identity-delete')
                 return null;
             return payload;
         }
