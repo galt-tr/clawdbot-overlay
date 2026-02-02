@@ -1,3 +1,4 @@
+import { broadcastAll } from "../relay.js"
 /**
  * ClawdbotServiceLookupService
  *
@@ -130,6 +131,24 @@ export class ClawdbotServiceLookupService implements LookupService {
       } satisfies ServiceRecord)
       .onConflict(['txid', 'outputIndex'])
       .merge()
+
+    // Broadcast new service announcement to all connected agents
+    const reached = broadcastAll({
+      type: "service-announced",
+      service: {
+        identityKey: data.identityKey,
+        serviceId: data.serviceId,
+        name: data.name,
+        description: data.description,
+        pricingModel: data.pricing.model,
+        pricingSats: data.pricing.amountSats,
+      },
+      txid,
+      timestamp: Date.now(),
+    })
+    if (reached > 0) {
+      console.log(`📢 Broadcast service-announced "${data.serviceId}" to ${reached} agent(s)`)
+    }
   }
 
   // -------------------------------------------------------------------------
