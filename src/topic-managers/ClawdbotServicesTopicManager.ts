@@ -15,8 +15,9 @@
  */
 
 import type { TopicManager, AdmittanceInstructions } from '@bsv/overlay'
-import { Transaction, Script, OP } from '@bsv/sdk'
-import { PROTOCOL_ID, type ClawdbotServiceData } from '../types.js'
+import {Transaction, Script, OP, PushDrop, Utils} from '@bsv/sdk'
+import {PROTOCOL_ID, type ClawdbotServiceData, type ClawdbotIdentityData} from '../types.js'
+import {extractPayload} from "../extract.js";
 
 export class ClawdbotServicesTopicManager implements TopicManager {
   private getSubjectTransaction (beef: number[]): Transaction {
@@ -24,102 +25,12 @@ export class ClawdbotServicesTopicManager implements TopicManager {
   }
 
   /**
-   * Extract data pushes from an OP_RETURN script.
-   *
-   * The @bsv/sdk v1.10+ parseChunks collapses everything after OP_RETURN
-   * into a single chunk with all remaining bytes as `data`. This helper
-   * re-parses those bytes to extract the individual pushdata fields.
-   *
-   * Supports both the legacy 4-chunk format and the collapsed 2-chunk format.
-   */
-  private extractOpReturnPushes (script: Script): Uint8Array[] | null {
-    const chunks = script.chunks
-
-    // --- Legacy 4+ chunk format (older SDK) ---
-    if (chunks.length >= 4 &&
-        chunks[0].op === OP.OP_FALSE &&
-        chunks[1].op === OP.OP_RETURN) {
-      const pushes: Uint8Array[] = []
-      for (let i = 2; i < chunks.length; i++) {
-        if (chunks[i].data) pushes.push(new Uint8Array(chunks[i].data!))
-      }
-      return pushes
-    }
-
-    // --- Collapsed 2-chunk format (SDK v1.10+) ---
-    if (chunks.length === 2 &&
-        chunks[0].op === OP.OP_FALSE &&
-        chunks[1].op === OP.OP_RETURN &&
-        chunks[1].data) {
-      const blob = chunks[1].data
-      const pushes: Uint8Array[] = []
-      let pos = 0
-      while (pos < blob.length) {
-        const op = blob[pos++]
-        if (op > 0 && op <= 75) {
-          const end = Math.min(pos + op, blob.length)
-          pushes.push(new Uint8Array(blob.slice(pos, end)))
-          pos = end
-        } else if (op === 0x4c) {
-          const len = blob[pos++] ?? 0
-          const end = Math.min(pos + len, blob.length)
-          pushes.push(new Uint8Array(blob.slice(pos, end)))
-          pos = end
-        } else if (op === 0x4d) {
-          const len = (blob[pos] ?? 0) | ((blob[pos + 1] ?? 0) << 8)
-          pos += 2
-          const end = Math.min(pos + len, blob.length)
-          pushes.push(new Uint8Array(blob.slice(pos, end)))
-          pos = end
-        } else if (op === 0x4e) {
-          const len = ((blob[pos] ?? 0) |
-            ((blob[pos + 1] ?? 0) << 8) |
-            ((blob[pos + 2] ?? 0) << 16) |
-            ((blob[pos + 3] ?? 0) << 24)) >>> 0
-          pos += 4
-          const end = Math.min(pos + len, blob.length)
-          pushes.push(new Uint8Array(blob.slice(pos, end)))
-          pos = end
-        } else {
-          break
-        }
-      }
-      return pushes.length >= 2 ? pushes : null
-    }
-
-    return null
-  }
-
-  /**
    * Check if a script is a valid Clawdbot service OP_RETURN output.
    * Expected format: OP_FALSE OP_RETURN <protocol_prefix> <json_payload>
    */
   private parseServiceOutput (script: Script): ClawdbotServiceData | null {
-    const pushes = this.extractOpReturnPushes(script)
-    if (!pushes || pushes.length < 2) return null
-
-    // Check protocol identifier (first push)
-    const protocolStr = new TextDecoder().decode(pushes[0])
-    if (protocolStr !== PROTOCOL_ID) return null
-
-    // Parse JSON payload (second push)
-    const payloadBytes = pushes[1]
     try {
-      const payload = JSON.parse(
-        new TextDecoder().decode(payloadBytes)
-      ) as ClawdbotServiceData
-
-      // Validate required fields
-      if (payload.protocol !== PROTOCOL_ID) return null
-      if (payload.type !== 'service') return null
-      if (typeof payload.identityKey !== 'string' || !/^[0-9a-fA-F]{66}$/.test(payload.identityKey)) return null
-      if (typeof payload.serviceId !== 'string' || payload.serviceId.length === 0) return null
-      if (typeof payload.name !== 'string' || payload.name.length === 0) return null
-      if (!payload.pricing || typeof payload.pricing.model !== 'string') return null
-      if (typeof payload.pricing.amountSats !== 'number' || payload.pricing.amountSats < 0) return null
-      if (typeof payload.timestamp !== 'string') return null
-
-      return payload
+      return extractPayload(script) as ClawdbotServiceData
     } catch {
       return null
     }

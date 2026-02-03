@@ -19,7 +19,7 @@ import type {
   OutputSpent,
   LookupServiceMetaData,
 } from '@bsv/overlay'
-import type { LookupQuestion } from '@bsv/sdk'
+import type {LookupQuestion, Script} from '@bsv/sdk'
 import type Knex from 'knex'
 import { OP } from '@bsv/sdk'
 import {
@@ -29,6 +29,7 @@ import {
   type AgentLookupQuery,
   type AgentRecord,
 } from '../types.js'
+import {extractPayload} from "../extract.js";
 
 // ---------------------------------------------------------------------------
 //  Knex migration for the agents table
@@ -99,61 +100,62 @@ export class ClawdbotAgentLookupService implements LookupService {
   readonly admissionMode: AdmissionMode = 'locking-script'
   readonly spendNotificationMode: SpendNotificationMode = 'none'
 
-  constructor (private readonly knex: Knex.Knex) {}
+  constructor(private readonly knex: Knex.Knex) {
+  }
 
   // -------------------------------------------------------------------------
   //  outputAdmittedByTopic — called when an identity UTXO is admitted
   // -------------------------------------------------------------------------
-  async outputAdmittedByTopic (payload: OutputAdmittedByTopic): Promise<void> {
+  async outputAdmittedByTopic(payload: OutputAdmittedByTopic): Promise<void> {
     if (payload.mode !== 'locking-script') return
     if (payload.topic !== TOPICS.IDENTITY) return
 
-    const { txid, outputIndex, lockingScript } = payload
+    const {txid, outputIndex, lockingScript} = payload
 
     // Parse the locking script to extract identity data
-    const data = this.parseIdentityFromScript(lockingScript)
+    const data = extractPayload(lockingScript) as ClawdbotIdentityData
     if (!data) return
 
     // Upsert: if this agent already has a record, replace it
     await this.knex(AGENTS_TABLE)
-      .insert({
-        txid,
-        outputIndex,
-        identityKey: data.identityKey,
-        name: data.name,
-        description: data.description,
-        channels: JSON.stringify(data.channels),
-        capabilities: JSON.stringify(data.capabilities),
-        timestamp: data.timestamp,
-        createdAt: new Date().toISOString(),
-      } satisfies AgentRecord)
-      .onConflict(['txid', 'outputIndex'])
-      .merge()
+        .insert({
+          txid,
+          outputIndex,
+          identityKey: data.identityKey,
+          name: data.name,
+          description: data.description,
+          channels: JSON.stringify(data.channels),
+          capabilities: JSON.stringify(data.capabilities),
+          timestamp: data.timestamp,
+          createdAt: new Date().toISOString(),
+        } satisfies AgentRecord)
+        .onConflict(['txid', 'outputIndex'])
+        .merge()
   }
 
   // -------------------------------------------------------------------------
   //  outputSpent — called when an identity UTXO is spent (update or deregister)
   // -------------------------------------------------------------------------
-  async outputSpent (payload: OutputSpent): Promise<void> {
+  async outputSpent(payload: OutputSpent): Promise<void> {
     if (payload.topic !== TOPICS.IDENTITY) return
     await this.knex(AGENTS_TABLE)
-      .where({ txid: payload.txid, outputIndex: payload.outputIndex })
-      .delete()
+        .where({txid: payload.txid, outputIndex: payload.outputIndex})
+        .delete()
   }
 
   // -------------------------------------------------------------------------
   //  outputEvicted — legal eviction of a UTXO
   // -------------------------------------------------------------------------
-  async outputEvicted (txid: string, outputIndex: number): Promise<void> {
+  async outputEvicted(txid: string, outputIndex: number): Promise<void> {
     await this.knex(AGENTS_TABLE)
-      .where({ txid, outputIndex })
-      .delete()
+        .where({txid, outputIndex})
+        .delete()
   }
 
   // -------------------------------------------------------------------------
   //  lookup — query the index
   // -------------------------------------------------------------------------
-  async lookup (question: LookupQuestion): Promise<LookupFormula> {
+  async lookup(question: LookupQuestion): Promise<LookupFormula> {
     const query = (question.query ?? {}) as AgentLookupQuery
     let qb = this.knex(AGENTS_TABLE).select('txid', 'outputIndex')
 
@@ -181,7 +183,7 @@ export class ClawdbotAgentLookupService implements LookupService {
   // -------------------------------------------------------------------------
   //  Documentation & metadata
   // -------------------------------------------------------------------------
-  async getDocumentation (): Promise<string> {
+  async getDocumentation(): Promise<string> {
     return `# ls_clawdbot_agents — Clawdbot Agent Lookup Service
 
 ## Overview
@@ -213,75 +215,12 @@ BEEF-formatted transactions for the caller.
 `
   }
 
-  async getMetaData (): Promise<LookupServiceMetaData> {
+  async getMetaData(): Promise<LookupServiceMetaData> {
     return {
       name: 'Clawdbot Agent Lookup Service',
       shortDescription: 'Search for Clawdbot agents by identity key, name, or capability',
       version: '0.1.0',
       informationURL: 'https://github.com/galt-tr/clawdbot-overlay',
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  //  Private helpers
-  // -------------------------------------------------------------------------
-
-  /**
-   * Extract ClawdbotIdentityData from a locking script.
-   */
-  /**
-   * Extract data pushes from an OP_RETURN script.
-   * Handles both legacy 4+ chunk format and collapsed 2-chunk format (SDK v1.10+).
-   */
-  private extractOpReturnPushes (script: { chunks: Array<{ op: number; data?: number[] }> }): Uint8Array[] | null {
-    const chunks = script.chunks
-
-    // Legacy 4+ chunk format
-    if (chunks.length >= 4 && chunks[0].op === OP.OP_FALSE && chunks[1].op === OP.OP_RETURN) {
-      const pushes: Uint8Array[] = []
-      for (let i = 2; i < chunks.length; i++) {
-        if (chunks[i].data) pushes.push(new Uint8Array(chunks[i].data!))
-      }
-      return pushes
-    }
-
-    // Collapsed 2-chunk format (OP_FALSE + OP_RETURN with data blob)
-    if (chunks.length === 2 && chunks[0].op === OP.OP_FALSE && chunks[1].op === OP.OP_RETURN && chunks[1].data) {
-      const blob = chunks[1].data
-      const pushes: Uint8Array[] = []
-      let pos = 0
-      while (pos < blob.length) {
-        const op = blob[pos++]
-        if (op > 0 && op <= 75) {
-          pushes.push(new Uint8Array(blob.slice(pos, pos + op))); pos += op
-        } else if (op === 0x4c) {
-          const len = blob[pos++] ?? 0; pushes.push(new Uint8Array(blob.slice(pos, pos + len))); pos += len
-        } else if (op === 0x4d) {
-          const len = (blob[pos] ?? 0) | ((blob[pos + 1] ?? 0) << 8); pos += 2
-          pushes.push(new Uint8Array(blob.slice(pos, pos + len))); pos += len
-        } else { break }
-      }
-      return pushes.length >= 2 ? pushes : null
-    }
-
-    return null
-  }
-
-  private parseIdentityFromScript (script: { chunks: Array<{ op: number; data?: number[] }> }): ClawdbotIdentityData | null {
-    const pushes = this.extractOpReturnPushes(script)
-    if (!pushes || pushes.length < 2) return null
-
-    const protocolStr = new TextDecoder().decode(pushes[0])
-    if (protocolStr !== PROTOCOL_ID) return null
-
-    try {
-      const payload = JSON.parse(
-        new TextDecoder().decode(pushes[1])
-      ) as ClawdbotIdentityData
-      if (payload.type !== 'identity') return null
-      return payload
-    } catch {
-      return null
     }
   }
 }
